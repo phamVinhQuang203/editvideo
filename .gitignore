@@ -8,6 +8,7 @@ jobs/
 work/
 logs/
 analysis_cache/
+viral_cache/
 .tmp_*/
 venv/
 __pycache__/
