@@ -1,0 +1,16 @@
+# === TUỲ CHỌN — chỉ cài nếu cần các tính năng nặng ===
+
+# (1) TÁCH NHẠC NỀN cho nhánh REMAKE khi video nguồn có tiếng Trung (demucs).
+#     NẶNG ~3-5GB. Nhánh "Tạo video / Review" KHÔNG cần cái này.
+demucs==4.0.1
+torch
+torchaudio
+torchcodec
+
+# (2) BLUR CHỮ TRUNG (che chữ Douyin). Mặc định TẮT cho Review (nguồn TikTok Việt không có chữ Trung).
+#     Chỉ cài nếu bật blur.
+opencv-python
+easyocr
+
+# (3) Giọng đọc dự phòng edge-tts (nếu không dùng Vivibe/VoiceHay).
+edge-tts==7.2.8

@@ -1,0 +1,15 @@
+{
+  "_help": "Setup tự copy file này thành config.json. Điền genmax_api_key và chạy codex login trước khi dùng.",
+  "codex_cmd": "codex",
+  "codex_model": "gpt-5.6-sol",
+  "video_encoder": "qsv",
+  "tts_provider": "genmax",
+  "genmax_api_key": "DIEN_GENMAX_KEY_O_DAY",
+  "genmax_voice_id": "pNInz6obpgDQGcFmaJgB",
+  "genmax_model": "eleven_v3",
+  "genmax_speed": 1.05,
+  "vivibe_speed": 1.08,
+  "vivibe_api_key": "DIEN_VIVIBE_KEY_O_DAY",
+  "voicehay_api_key": "DIEN_VOICEHAY_KEY_O_DAY_NEU_DUNG",
+  "output_dir": ""
+}

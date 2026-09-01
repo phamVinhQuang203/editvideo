@@ -1,0 +1,10 @@
+VIDEO STUDIO — BẢN UPDATE NHỊP DỰNG NHANH
+
+- Ưu tiên kịch bản storytelling khi chọn tự động.
+- Mỗi clip tối đa 2,5 giây, mục tiêu khoảng 10 visual beat/video.
+- Thêm chuyển động zoom/pan nhẹ và có fallback cắt phẳng.
+- Voice nhanh, rõ và prompt bám sát cảnh hơn.
+- Giữ nguyên cấu hình máy, API key, jobs, output và cache phân tích.
+
+Đã gộp với các tính năng đang có trên máy: GPU, Google Drive, Vivibe,
+Adam 3, SSL fallback và thông báo lỗi render chi tiết.

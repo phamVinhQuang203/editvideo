@@ -1,0 +1,18 @@
+config.json
+users.json
+.auth_secret
+cloudflare-token.txt
+input/
+output/
+jobs/
+work/
+logs/
+analysis_cache/
+.tmp_*/
+venv/
+__pycache__/
+*.pyc
+debug.log
+users - Copy.json
+.gitnexus/
+tools/GitNexus-main/

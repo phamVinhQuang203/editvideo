@@ -1,0 +1,53 @@
+VIDEO STUDIO - CAI TREN MAY WINDOWS MOI
+=======================================
+
+1. Giai nen TOAN BO goi cai dat vao thu muc mong muon, vi du D:\Tools\video-studio.
+2. Bam dup setup.cmd va cho chay xong.
+3. Mo cua so CMD/PowerShell moi, chay: codex login
+4. Mo config.json, thay DIEN_GENMAX_KEY_O_DAY bang API key GenMax cua ban.
+5. Bam dup start-studio.cmd.
+6. Mo http://127.0.0.1:7995 neu trinh duyet khong tu mo.
+7. Dang nhap lan dau: admin / admin123, sau do vao Tai khoan de DOI MAT KHAU ngay.
+
+Phan quyen:
+- Admin xem tat ca job/video, Cai dat, Nhat ky va quan ly tai khoan.
+- User chi xem, tai va xoa job/video do chinh minh tao.
+- Admin tao user moi trong muc Tai khoan.
+
+Mac dinh:
+- Provider: GenMax / ElevenLabs
+- Voice: Adam - Dominant, Firm
+- Model: eleven_v3
+- Co emotion tags, cach xung ho va tone hai huoc da cau hinh.
+
+Neu can GPU/tach nhac/blur chu Trung:
+  venv\Scripts\python.exe -m pip install -r requirements-optional.txt
+
+Chay ngam:
+- Chay ngam: wscript.exe .\start-studio-hidden.vbs
+- Log xu ly job: Get-Content .\logs\studio.log -Wait -Tail 100
+
+CLOUDFLARE - DUNG WEBSITE QUA INTERNET
+======================================
+
+Cach nhanh (khong can domain):
+1. Bam dup start-cloudflare.cmd.
+2. Lan dau script se cai cloudflared. Sau khi cai xong, dong cua so va bam lai.
+3. Cho den khi hien link https://....trycloudflare.com, gui link nay cho nguoi dung.
+4. Giu cua so Cloudflare mo. Moi lan chay lai, link tam co the thay doi.
+
+Cach co dinh (domain rieng):
+1. Vao Cloudflare Zero Trust -> Networks -> Tunnels -> Create a tunnel.
+2. Chon Cloudflared, tao tunnel va copy token Windows.
+3. Copy cloudflare-token.example.txt thanh cloudflare-token.txt, chi dan TOKEN vao file.
+4. Trong Public Hostname cua tunnel, chon domain/subdomain va Service = http://localhost:7995.
+5. Bam start-cloudflare.cmd. Domain se giu co dinh.
+
+Bao mat:
+- KHONG chia se cloudflare-token.txt; file nay da duoc bo qua trong .gitignore.
+- Phai doi mat khau admin123 truoc khi gui link Cloudflare cho nguoi khac.
+- User chi thay job/video cua chinh minh; admin thay toan bo.
+- Video upload lon co the vuot gioi han request cua goi Cloudflare; nen dan link nguon.
+
+KHONG chia se config.json vi file nay chua API key.
+Goi cai dat khong kem key, job, video, cache, log hay venv tu may goc.
