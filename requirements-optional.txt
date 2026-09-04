@@ -3,8 +3,9 @@
 # (1) TÁCH NHẠC NỀN cho nhánh REMAKE khi video nguồn có tiếng Trung (demucs).
 #     NẶNG ~3-5GB. Nhánh "Tạo video / Review" KHÔNG cần cái này.
 demucs==4.0.1
-torch
-torchaudio
+torch==2.11.0
+torchaudio==2.11.0
+torchvision==0.26.0
 torchcodec
 
 # (2) BLUR CHỮ TRUNG (che chữ Douyin). Mặc định TẮT cho Review (nguồn TikTok Việt không có chữ Trung).

@@ -8,7 +8,7 @@ KHÔNG đăng bài. Dùng cho 2 nhánh:
 Độc lập với autopilot: chỉ GỌI các script ngoài (renderer, codex, ffmpeg, demucs, detect_blur),
 không import pipeline.py (tránh side-effect wrap stdout).
 """
-import sys, os, re, json, time, random, subprocess, glob, shutil
+import sys, os, re, json, time, random, subprocess, glob, shutil, base64
 
 # ---- ĐƯỜNG DẪN PORTABLE: mọi thứ tính TƯƠNG ĐỐI theo thư mục gói + config.json ----
 # app/ nằm trong <ROOT>; vendor/ chứa các script gốc (render_autovoice, detect_blur, ...).
@@ -364,14 +364,39 @@ _WH = None
 def whisper():
     global _WH
     if _WH is None:
-        from faster_whisper import WhisperModel
+        # CTranslate2 chỉ dùng torch như thư viện tùy chọn. Torch lỗi DLL trên
+        # Windows không được phép chặn bộ máy CPU độc lập của faster-whisper.
+        torch_module = None
+        torch_error = None
         try:
-            import torch
-            if torch.cuda.is_available():
+            import torch as torch_module
+        except Exception as exc:
+            torch_error = exc
+
+        missing = object()
+        previous_torch = missing
+        if torch_module is None:
+            previous_torch = sys.modules.get("torch", missing)
+            sys.modules["torch"] = None
+        try:
+            from faster_whisper import WhisperModel
+        finally:
+            if torch_module is None:
+                if previous_torch is missing:
+                    sys.modules.pop("torch", None)
+                else:
+                    sys.modules["torch"] = previous_torch
+
+        try:
+            if torch_module is not None and torch_module.cuda.is_available():
                 # GTX 10xx (Pascal) không có FP16 hiệu quả; float32 vẫn nhanh hơn CPU.
                 _WH = WhisperModel("small", device="cuda", compute_type="float32")
-                log(f"whisper: dùng GPU {torch.cuda.get_device_name(0)}")
+                log(f"whisper: dùng GPU {torch_module.cuda.get_device_name(0)}")
             else:
+                if torch_error is not None:
+                    raise RuntimeError(
+                        f"PyTorch không khởi động: {type(torch_error).__name__}: {torch_error}"
+                    )
                 raise RuntimeError("CUDA unavailable")
         except Exception as e:
             log(f"whisper: fallback CPU ({str(e)[:80]})")
@@ -385,7 +410,8 @@ def transcribe(src, workdir, want_segments=False, language="zh"):
     ff(["ffmpeg","-y","-i",src,"-vn","-ac","1","-ar","16000",wav])
     try:
         segs, _ = whisper().transcribe(wav, language=language, vad_filter=True)
-    except Exception:
+    except Exception as exc:
+        log(f"whisper lỗi: {type(exc).__name__}: {str(exc)[:180]}")
         return "", []
     out_txt = []; out_seg = []
     for s in segs:
@@ -510,7 +536,8 @@ def autovoice_audio(la, src, workdir):
         except Exception:
             demucs_device = "cpu"
         log(f"demucs: dùng {demucs_device}")
-        subprocess.run([VPY,"-m","demucs","--device",demucs_device,"--segment","7",
+        demucs_launcher = os.path.join(VENDOR, "demucs_compat.py")
+        subprocess.run([VPY,demucs_launcher,"--device",demucs_device,"--segment","7",
                         "--two-stems=vocals","-n","htdemucs","--out",workdir,wav],
                        capture_output=True, timeout=1800)
         bed = os.path.join(workdir, "htdemucs", "src", "no_vocals.wav")
@@ -605,10 +632,148 @@ def _tikwm(url, workdir):
         log(f"tikwm loi: {str(e)[:80]}")
         return None, {}
 
+def is_youtube_url(url):
+    low = str(url or "").lower()
+    return any(host in low for host in ("youtube.com/", "youtu.be/", "youtube-nocookie.com/"))
+
+def normalize_douyin_url(url):
+    """Đổi link jingxuan/modal_id thành URL video mà downloader hiểu được."""
+    value = str(url or "").strip()
+    match = re.search(r"(?:modal_id=|/video/)(\d{15,})", value)
+    if not match:
+        match = re.search(r"(\d{15,})", value)
+    return f"https://www.douyin.com/video/{match.group(1)}" if match else value
+
+def _douyin_public_resolver(url, workdir):
+    """Phân giải video Douyin công khai, không yêu cầu người dùng nhập cookie."""
+    try:
+        import httpx
+        canonical = normalize_douyin_url(url)
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36"),
+            "Accept": "*/*", "Origin": "https://snapdouyin.app",
+            "Referer": "https://snapdouyin.app/",
+        }
+        with httpx.Client(headers=headers, timeout=90, follow_redirects=True) as client:
+            page = client.get("https://snapdouyin.app/")
+            page.raise_for_status()
+            token_match = re.search(
+                r'id=["\']token["\'][^>]*value=["\']([^"\']+)', page.text, re.I)
+            if not token_match:
+                token_match = re.search(
+                    r'value=["\']([^"\']+)["\'][^>]*id=["\']token["\']', page.text, re.I)
+            if not token_match:
+                raise ValueError("resolver token not found")
+            encoded = base64.b64encode(canonical.encode("utf-8")).decode("ascii")
+            salt = base64.b64encode(b"aio-dl").decode("ascii")
+            response = client.post(
+                "https://snapdouyin.app/wp-json/mx-downloader/video-data/",
+                data={"url": canonical, "token": token_match.group(1),
+                      "hash": f"{encoded}{len(canonical) + 1000}{salt}"})
+            response.raise_for_status()
+            info = response.json()
+            medias = [m for m in (info.get("medias") or [])
+                      if m.get("videoAvailable", True)
+                      and str(m.get("extension", "")).lower() in ("mp4", "mov", "webm")
+                      and m.get("url")]
+            if not medias:
+                raise ValueError(str(info.get("error") or "resolver returned no video"))
+            # Ưu tiên HD dung lượng hợp lý để phim dài vẫn render ổn định.
+            media = next((m for m in medias if str(m.get("quality", "")).lower() == "hd"),
+                         medias[0])
+            resolver_url = (str(media["url"]) +
+                            ("&" if "?" in str(media["url"]) else "?") +
+                            "bandwidth_saving=1")
+            redirect = client.get(resolver_url, follow_redirects=False)
+            direct_url = redirect.headers.get("location")
+            if redirect.status_code not in (301, 302, 303, 307, 308) or not direct_url:
+                redirect.raise_for_status()
+                direct_url = resolver_url
+            # CDN từ chối Origin/Referer của trang phân giải; dùng request sạch.
+            media_response = httpx.get(direct_url, headers={"User-Agent": headers["User-Agent"]},
+                                       timeout=180, follow_redirects=True)
+            media_response.raise_for_status()
+            if len(media_response.content) < 50_000:
+                raise ValueError("resolver returned an empty video")
+            dst = os.path.join(workdir, "douyin.mp4")
+            with open(dst, "wb") as stream:
+                stream.write(media_response.content)
+            return dst, {"title": info.get("title", ""), "dur": info.get("duration", ""),
+                         "uploader": "Douyin", "url": canonical}
+    except Exception as exc:
+        log(f"download Douyin tự động lỗi: {type(exc).__name__}: {str(exc)[:160]}")
+        return None, {}
+
+def _douyin_f2(url, workdir):
+    cookie = str(os.environ.get("DOUYIN_COOKIE") or CONFIG.get("douyin_cookie") or "").strip()
+    if not cookie:
+        log("Douyin cần cookie: vào Cài đặt > Douyin Cookie và lưu cookie đăng nhập")
+        return None, {}
+    f2_python = os.path.join(ROOT, ".f2-venv", "Scripts", "python.exe")
+    launcher = os.path.join(VENDOR, "douyin_f2_download.py")
+    if not os.path.isfile(f2_python):
+        log("Thiếu .f2-venv: hãy chạy lại setup.cmd để cài downloader Douyin")
+        return None, {}
+    output_dir = os.path.join(workdir, "douyin_f2")
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        result = subprocess.run([f2_python, "-X", "utf8", launcher,
+                                 normalize_douyin_url(url), output_dir],
+                                input=cookie, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=360)
+        candidates = [path for path in glob.glob(os.path.join(output_dir, "**", "*"), recursive=True)
+                      if os.path.isfile(path) and os.path.splitext(path)[1].lower() in
+                      (".mp4", ".mov", ".mkv", ".webm") and os.path.getsize(path) > 50_000]
+        if candidates:
+            source = max(candidates, key=os.path.getsize)
+            return source, {"title": os.path.splitext(os.path.basename(source))[0],
+                            "dur": "", "uploader": "Douyin", "url": url}
+        blob = ((result.stdout or "") + (result.stderr or "")).replace(cookie, "[COOKIE]")
+        log(f"download Douyin F2 lỗi: {blob[-220:].strip()}")
+    except Exception as exc:
+        log(f"download Douyin F2 lỗi: {type(exc).__name__}: {str(exc)[:160]}")
+    return None, {}
+
+def _youtube(url, workdir):
+    """Tải một video/Short YouTube công khai bằng yt-dlp trong chính venv đang chạy."""
+    try:
+        import yt_dlp
+        outtmpl = os.path.join(workdir, "youtube.%(ext)s")
+        opts = {
+            "outtmpl": outtmpl,
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "noprogress": True,
+            "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
+        }
+        with yt_dlp.YoutubeDL(opts) as downloader:
+            info = downloader.extract_info(url, download=True) or {}
+        candidates = sorted(glob.glob(os.path.join(workdir, "youtube.*")),
+                            key=lambda path: os.path.getsize(path), reverse=True)
+        source = next((path for path in candidates
+                       if os.path.isfile(path) and os.path.getsize(path) > 50_000
+                       and not path.endswith((".part", ".ytdl", ".json"))), None)
+        if not source:
+            return None, {}
+        return source, {"title": info.get("title", ""), "dur": info.get("duration", ""),
+                        "uploader": info.get("uploader", ""), "url": info.get("webpage_url", url)}
+    except Exception as exc:
+        log(f"download YouTube lỗi: {str(exc)[:180]}")
+        return None, {}
+
 def download(url, workdir):
     """Ưu tiên tikwm (TikTok/Douyin, không watermark). FB -> fb_download. Douyin -> thêm fallback signed."""
     os.makedirs(workdir, exist_ok=True)
     low = url.lower()
+    is_douyin = "douyin.com" in low
+    # YouTube dùng nhánh riêng; không đi qua downloader Facebook/TikWM.
+    if is_youtube_url(url):
+        return _youtube(url, workdir)
     # 0) Google Drive công khai (link /file/d/... hoặc open?id=...)
     if "drive.google.com" in low:
         try:
@@ -620,8 +785,8 @@ def download(url, workdir):
         except Exception as e:
             log(f"download Google Drive lỗi: {str(e)[:120]}")
     # 1) tikwm cho tiktok/douyin
-    if "tiktok.com" in low or "douyin.com" in low or "/v/" in low:
-        f, meta = _tikwm(url, workdir)
+    if "tiktok.com" in low or is_douyin or "/v/" in low:
+        f, meta = _tikwm(normalize_douyin_url(url) if is_douyin else url, workdir)
         if f: return f, meta
     # 2) fb_download (yt-dlp impersonate) — tốt cho FB, thử luôn cho link khác
     try:
@@ -637,7 +802,10 @@ def download(url, workdir):
     if f: return f, meta
     # 4) douyin_signed nếu là link douyin có aweme id
     m = re.search(r"(\d{15,})", url)
-    if m and "douyin" in low:
+    if m and is_douyin:
+        f, meta = _douyin_public_resolver(url, workdir)
+        if f:
+            return f, meta
         try:
             from scrapers import douyin_signed as ds
             d = ds.call_signed("/aweme/v1/web/aweme/detail/", {"aweme_id": m.group(1)})
@@ -654,8 +822,12 @@ def download(url, workdir):
                         open(dst,"wb").write(resp.content)
                         return dst, {"title":"", "dur":"", "uploader":"", "url":url}
                 except Exception: pass
+        except ModuleNotFoundError:
+            # Bản cài đặt mới dùng F2; module signed cũ có thể không tồn tại.
+            pass
         except Exception as e:
             log(f"download douyin loi: {str(e)[:80]}")
+        return _douyin_f2(url, workdir)
     return None, {}
 
 # ---- JOB STATE ----

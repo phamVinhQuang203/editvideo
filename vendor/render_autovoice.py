@@ -508,7 +508,11 @@ def generate_tts(script: Path, output: Path, requested_voice: str, rate: str):
         text = normalize_genmax_tts(script.read_text(encoding="utf-8", errors="replace"))
         if not text:
             raise RuntimeError(f"Missing voice text: {script}")
-        voice_id = os.environ.get("GENMAX_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip()
+        # engine.py đã đổi lựa chọn trên giao diện thành voice ID thật. Chỉ
+        # dùng cấu hình mặc định khi caller gửi auto/tên không hợp lệ.
+        requested = str(requested_voice or "").strip()
+        voice_id = (requested if re.fullmatch(r"[A-Za-z0-9_-]{16,}", requested)
+                    else os.environ.get("GENMAX_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip())
         meta = run_genmax_tts_with_retry(text, voice_id, raw_voice, attempts=attempts)
         return raw_voice, {"provider": "genmax", "voiceId": voice_id, **meta}
     if provider in {"local_f5", "f5", "f5_local"}:

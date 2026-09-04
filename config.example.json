@@ -5,6 +5,7 @@
   "video_encoder": "qsv",
   "tts_provider": "genmax",
   "genmax_api_key": "DIEN_GENMAX_KEY_O_DAY",
+  "douyin_cookie": "",
   "genmax_voice_id": "pNInz6obpgDQGcFmaJgB",
   "genmax_model": "eleven_v3",
   "genmax_speed": 1.05,

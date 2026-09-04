@@ -8,9 +8,9 @@ jobs/
 work/
 logs/
 analysis_cache/
-viral_cache/
 .tmp_*/
 venv/
+.f2-venv/
 __pycache__/
 *.pyc
 debug.log

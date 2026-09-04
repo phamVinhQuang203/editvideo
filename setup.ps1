@@ -67,6 +67,12 @@ Say "Cai goi core (flask, httpx, faster-whisper)..."
 & $vpy -m pip install --upgrade pip | Out-Null
 & $vpy -m pip install -r "$root\requirements.txt"
 
+# F2 dung mot so phien ban thu vien khac Whisper nen dat trong venv rieng.
+$f2py = "$root\.f2-venv\Scripts\python.exe"
+if (-not (Test-Path $f2py)) { Say "Tao moi truong downloader Douyin..."; & $py -m venv "$root\.f2-venv" }
+& $f2py -m pip install --upgrade pip | Out-Null
+& $f2py -m pip install "f2==0.0.1.7"
+
 Head "6/6  Config + kiem tra"
 if (-not (Test-Path "$root\config.json")) { Copy-Item "$root\config.example.json" "$root\config.json"; Say "Da tao config.json (NHO dien genmax_api_key)." }
 & $vpy "$root\check_env.py"

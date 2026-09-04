@@ -24,7 +24,7 @@ else:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine as E
-import remake, review, viral
+import remake, review, translate
 from flask import Flask, request, jsonify, send_from_directory, Response, session, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -245,6 +245,18 @@ def save_genmax_key(key):
     os.environ["GENMAX_API_KEY"] = key
     return True
 
+def save_douyin_cookie(cookie):
+    cookie = str(cookie or "").strip()
+    if not cookie: return False
+    p = os.path.join(E.ROOT, "config.json")
+    try: cfg = json.load(open(p, encoding="utf-8"))
+    except Exception: cfg = {}
+    cfg["douyin_cookie"] = cookie
+    json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    E.CONFIG.update(cfg)
+    os.environ["DOUYIN_COOKIE"] = cookie
+    return True
+
 def facebook_pages():
     pages = [p for p in (E.CONFIG.get("facebook_pages") or [])
              if isinstance(p, dict) and p.get("id") and p.get("access_token")]
@@ -306,8 +318,12 @@ def worker():
             os.environ["AUTOVOICE_TTS_PROVIDER"] = provider if provider in ("genmax", "vivibe") else "vivibe"
             if job["kind"] == "remake":
                 remake.run_safe(job, E.save_job)
-            else:
+            elif job["kind"] == "review":
                 review.run_safe(job, E.save_job)
+            elif job["kind"] == "translate":
+                translate.run_safe(job, E.save_job)
+            else:
+                raise ValueError(f"Loại job không hợp lệ: {job['kind']}")
         except Exception as e:
             job["status"] = "error"; job["error"] = str(e); E.save_job(job)
         JOBQ.task_done()
@@ -388,32 +404,57 @@ def api_review():
         return jsonify({"ok": False, "err": "Chưa cấu hình Vivibe API key"}), 400
     return jsonify({"ok": True, "id": _make_job("review", inputs, opts)})
 
-@app.post("/api/viral/analyze")
-def api_viral_analyze():
-    data = request.get_json(silent=True) or {}
-    links = data.get("links") or []
-    if isinstance(links, str):
-        links = links.splitlines()
-    if not isinstance(links, list) or not any(str(link).strip() for link in links):
-        return jsonify({"ok": False, "err": "Hãy dán ít nhất 1 link TikTok hoặc Douyin"}), 400
-    try:
-        result = viral.analyze_links(links)
-        return jsonify({"ok": True, **result})
-    except Exception as exc:
-        E.log(f"viral analyze lỗi: {type(exc).__name__}: {exc}")
-        return jsonify({"ok": False, "err": f"Phân tích thất bại: {exc}"}), 500
-
-@app.get("/api/viral/thumb/<ident>")
-def api_viral_thumb(ident):
-    path = viral.thumbnail_path(ident)
-    if not path:
-        return jsonify({"ok": False, "err": "Không tìm thấy thumbnail"}), 404
-    return send_from_directory(os.path.dirname(path), os.path.basename(path))
+@app.post("/api/translate")
+def api_translate():
+    inputs, _ = _collect()
+    if not inputs:
+        return jsonify({"ok": False, "err": "Chưa có link/file phim cần dịch"}), 400
+    source_language = str(request.form.get("source_language") or "").strip().lower()
+    target_language = str(request.form.get("target_language") or "vi").strip().lower()
+    task_mode = str(request.form.get("task_mode") or "summary").strip().lower()
+    if task_mode not in ("translate", "summary"):
+        return jsonify({"ok": False, "err": "Chế độ xử lý không hợp lệ"}), 400
+    if task_mode == "summary":
+        target_language = "vi"
+    output_mode = (str(request.form.get("translation_output") or "both").strip().lower()
+                   if task_mode == "translate" else "summary")
+    original_subtitles = str(request.form.get("original_subtitles") or "smart_bottom").strip().lower()
+    if source_language not in ("", *translate.LANGUAGES.keys()):
+        return jsonify({"ok": False, "err": "Ngôn ngữ nguồn không hợp lệ"}), 400
+    if target_language not in translate.LANGUAGES:
+        return jsonify({"ok": False, "err": "Ngôn ngữ đích không hợp lệ"}), 400
+    if output_mode not in ("srt", "burn", "both", "summary", "all", "dub", "dub_subtitle"):
+        return jsonify({"ok": False, "err": "Kiểu đầu ra không hợp lệ"}), 400
+    if original_subtitles not in ("keep", "bottom", "top", "smart_bottom", "smart_top"):
+        return jsonify({"ok": False, "err": "Vị trí phụ đề gốc không hợp lệ"}), 400
+    summary_minutes = str(request.form.get("summary_minutes") or "auto").strip().lower()
+    if summary_minutes not in ("auto", "5", "10", "15", "20"):
+        return jsonify({"ok": False, "err": "Thời lượng tóm tắt không hợp lệ"}), 400
+    provider = str(request.form.get("tts_provider") or E.CONFIG.get("tts_provider") or "vivibe").lower()
+    voice = str(request.form.get("voice") or "auto").strip()
+    if task_mode == "summary" or output_mode in ("dub", "dub_subtitle"):
+        if provider not in ("genmax", "vivibe"):
+            return jsonify({"ok": False, "err": "Dịch vụ giọng đọc không hợp lệ"}), 400
+        if provider == "genmax" and not (os.environ.get("GENMAX_API_KEY") or E.CONFIG.get("genmax_api_key")):
+            return jsonify({"ok": False, "err": "Chưa cấu hình GenMax API key"}), 400
+        if provider == "vivibe" and not (os.environ.get("VIVIBE_API_KEY") or E.CONFIG.get("vivibe_api_key")):
+            return jsonify({"ok": False, "err": "Chưa cấu hình Vivibe API key"}), 400
+    opts = {"source_language": source_language, "target_language": target_language,
+            "task_mode": task_mode, "output_mode": output_mode, "make_summary": task_mode == "summary",
+            "summary_minutes": summary_minutes, "tts_provider": provider, "voice": voice,
+            "original_subtitles": original_subtitles}
+    return jsonify({"ok": True, "id": _make_job("translate", inputs, opts)})
 
 def _slim(j):
     o = j.get("opts", {}); nin = len(j.get("inputs", []))
     nv = int(o.get("n_variants", 1) or 1)
-    exp = nv * max(1, int(o.get("hook_variants", 1) or 1)) if j["kind"] == "review" else nv * max(1, nin)
+    if j["kind"] == "review":
+        exp = nv * max(1, int(o.get("hook_variants", 1) or 1))
+    elif j["kind"] == "translate":
+        counts = {"srt": 1, "burn": 1, "both": 2, "summary": 2}
+        exp = max(1, nin) * counts.get(o.get("output_mode"), 2)
+    else:
+        exp = nv * max(1, nin)
     return {"id":j["id"],"kind":j["kind"],"status":j["status"],"created_at":j.get("created_at"),
             "owner":j.get("owner", "legacy"),
             "n_out":len(j.get("outputs",[])),"n_in":nin,"expected":exp,
@@ -580,6 +621,7 @@ def api_get_settings():
     s["tts_provider"] = str(E.CONFIG.get("tts_provider", "vivibe")).lower()
     s["vivibe_key_set"] = bool(os.environ.get("VIVIBE_API_KEY") or E.CONFIG.get("vivibe_api_key"))
     s["genmax_key_set"] = bool(os.environ.get("GENMAX_API_KEY") or E.CONFIG.get("genmax_api_key"))
+    s["douyin_cookie_set"] = bool(os.environ.get("DOUYIN_COOKIE") or E.CONFIG.get("douyin_cookie"))
     s["facebook_pages"] = [{"id": p["id"], "name": p.get("name") or p["id"]}
                            for p in facebook_pages()]
     s["facebook_key_set"] = bool(s["facebook_pages"])
@@ -591,6 +633,7 @@ def api_set_settings():
     data = request.get_json(force=True) or {}
     saved_key = save_vivibe_key(data.pop("vivibe_api_key", ""))
     saved_genmax_key = save_genmax_key(data.pop("genmax_api_key", ""))
+    saved_douyin_cookie = save_douyin_cookie(data.pop("douyin_cookie", ""))
     if saved_key or saved_genmax_key:
         with _CREDITS_LOCK:
             _CREDITS_CACHE.update({"at": 0.0, "data": None})
@@ -601,6 +644,7 @@ def api_set_settings():
     result = save_settings(data)
     result["vivibe_key_set"] = saved_key or bool(os.environ.get("VIVIBE_API_KEY"))
     result["genmax_key_set"] = saved_genmax_key or bool(os.environ.get("GENMAX_API_KEY"))
+    result["douyin_cookie_set"] = saved_douyin_cookie or bool(os.environ.get("DOUYIN_COOKIE") or E.CONFIG.get("douyin_cookie"))
     result["facebook_key_set"] = fb_configured
     return jsonify(result)
 
@@ -1009,7 +1053,7 @@ textarea,input[type=text],input[type=password],select{background:#fff;border-col
 .page-posts-toolbar{display:flex;align-items:end;gap:9px;margin-bottom:14px}.page-posts-toolbar>div{min-width:220px}.page-posts-toolbar label{margin-top:0}.page-post-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.page-post{display:grid;grid-template-columns:112px minmax(0,1fr);background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden}.page-post-media{width:112px;height:112px;object-fit:cover;background:#edf2f4}.page-post-media.empty{border:0;border-radius:0;padding:0;display:grid;place-items:center}.page-post-body{padding:11px;min-width:0}.page-post-message{font-size:12px;line-height:1.45;white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.page-post-meta{color:var(--mut2);font-size:10px;margin-top:6px}.page-post-actions{display:flex;gap:7px;margin-top:8px}
 .post-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:8px}.post-metric{background:#f3f7f8;border-radius:4px;padding:5px 6px;min-width:0}.post-metric b{display:block;font-size:12px}.post-metric span{display:block;color:var(--mut2);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.post-engagement{color:var(--acc);font-size:10px;font-weight:650;margin-top:6px}
 .content-table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fff;max-height:68vh}.content-table{width:100%;min-width:1540px;border-collapse:separate;border-spacing:0;font-size:11px}.content-table th{position:sticky;top:0;z-index:2;background:#f3f6f8;color:#3d5360;font-weight:700;text-align:left;padding:10px 9px;border-bottom:1px solid var(--line);white-space:normal;line-height:1.2}.content-table td{padding:9px;border-bottom:1px solid #e8edef;vertical-align:middle;color:var(--fg)}.content-table tbody tr:hover td{background:#f8fbfb}.content-table th:first-child,.content-table td:first-child{position:sticky;left:0;z-index:1;background:#fff;min-width:300px}.content-table th:first-child{z-index:3;background:#f3f6f8}.content-preview{display:grid;grid-template-columns:60px minmax(0,1fr);gap:9px;align-items:center}.content-thumb{width:60px;height:60px;border-radius:6px;object-fit:cover;background:#edf2f4}.content-title{max-width:220px;font-size:11px;font-weight:650;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.content-date{color:var(--mut2);font-size:9px;margin-top:3px}.status-ok{display:inline-flex;align-items:center;gap:5px;border:1px solid #b9d9cb;border-radius:5px;padding:4px 7px;white-space:nowrap}.status-ok:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}.metric-cell{font-variant-numeric:tabular-nums;white-space:nowrap}.table-actions{display:flex;gap:5px;white-space:nowrap}
-.viral-toolbar{display:flex;gap:10px;align-items:flex-end}.viral-toolbar textarea{min-height:116px}.viral-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px;margin-top:14px}.viral-card{position:relative;border:1px solid var(--line);border-radius:8px;background:var(--card);overflow:hidden}.viral-card.pick{border-color:var(--acc);box-shadow:0 0 0 2px rgba(91,140,255,.16)}.viral-card img{width:100%;height:180px;object-fit:cover;background:var(--card2)}.viral-body{padding:11px}.viral-title{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.viral-meta{font-size:11px;color:var(--mut);margin-top:4px}.viral-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin:9px 0}.viral-stat{background:var(--card2);border-radius:5px;padding:5px;text-align:center;font-size:10px}.viral-stat b{display:block;color:var(--fg);font-size:12px}.origin{display:inline-flex;padding:4px 7px;border-radius:5px;font-size:10px;font-weight:700;background:#2a3450;color:#b8c8ff}.origin.original{background:#153c31;color:#75e0b8}.origin.reup{background:#48282a;color:#ffaaa9}.viral-actions{display:flex;gap:7px;margin-top:9px}.viral-actions .btn{flex:1}.viral-summary{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+.movie-modes{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.movie-mode{display:flex;align-items:flex-start;gap:10px;margin:0;padding:13px;border:1px solid var(--line2);border-radius:7px;background:#fff;cursor:pointer}.movie-mode:has(input:checked){border-color:var(--acc);background:var(--soft);box-shadow:0 0 0 2px var(--focus)}.movie-mode input{width:auto;margin:3px 0 0;accent-color:var(--acc)}.movie-mode b{display:block}.movie-mode span{display:block;color:var(--mut);font-size:11px;font-weight:400;margin-top:2px}
 .video-note{margin-top:8px;padding:9px;background:#f7f9fa;border:1px solid var(--line);border-radius:5px}.video-note-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#335e72;font-size:10px;font-weight:700;text-transform:uppercase}.video-note-actions{display:flex;align-items:center;gap:9px}.video-note-input{min-height:42px;max-height:100px;margin-top:5px;padding:7px 8px;font-size:11px;line-height:1.4}.save-video-note,.copy-video-note{border:0;background:transparent;color:var(--acc2);font-size:10px;font-weight:650;cursor:pointer;padding:2px 0}.save-video-note:hover,.copy-video-note:hover{text-decoration:underline}.save-video-note:disabled{opacity:.5;cursor:default}.posted-check{display:flex;align-items:center;gap:6px;margin:7px 0 0;color:#335e72;font-size:11px;font-weight:650;cursor:pointer}.posted-check input{width:15px;height:15px;margin:0;accent-color:var(--acc);cursor:pointer}.posted-check.saving{opacity:.55}
 .outs{grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:10px}.out{display:grid;grid-template-columns:160px minmax(0,1fr);align-items:start}.out video{width:160px;aspect-ratio:9/16}.out .m{padding:11px 12px;min-width:0}.out-title{display:flex;justify-content:space-between;gap:8px;align-items:flex-start;margin-bottom:7px;color:var(--fg);font-size:12px;font-weight:650}.out-duration{color:var(--mut2);font-weight:500;white-space:nowrap}.out-tags{margin-bottom:6px}.dl{margin-top:2px;font-weight:650}
 @media(max-width:900px){.cols4{grid-template-columns:repeat(2,1fr)}.row3{grid-template-columns:1fr 1fr}.stepper{display:grid;grid-template-columns:1fr}.content{padding:20px 20px 96px}.top{padding:15px 20px}}
@@ -1077,18 +1121,37 @@ https://www.tiktok.com/@.../video/..."></textarea>
     </div>
    </section>
 
-   <!-- VIRAL / GỐC - REUP -->
-   <section class="view" id="v-viral">
+   <!-- DỊCH PHIM -->
+   <section class="view" id="v-translate">
     <div class="card">
-     <h2 class="hero-h">🔥 Kho video viral · kiểm tra gốc/reup</h2>
-     <p class="hero-d">Dán tối đa 12 link TikTok/Douyin. Tool tải metadata, chấm điểm viral, nhóm video có hình ảnh giống nhau và ước lượng nguồn gốc. Kết luận chỉ là tín hiệu hỗ trợ, không phải xác minh bản quyền.</p>
-     <div class="viral-toolbar">
-      <div style="flex:1"><label>Link cần phân tích (mỗi dòng một link)</label><textarea id="viralLinks" placeholder="https://www.tiktok.com/@.../video/...&#10;https://www.douyin.com/video/..."></textarea></div>
-      <button class="btn" id="analyzeViral" style="margin-bottom:1px">🔎 Phân tích</button>
-     </div>
-     <div class="viral-summary" id="viralSummary"></div>
-     <div class="viral-grid" id="viralResults"><div class="empty">Chưa có dữ liệu. Hãy dán các link muốn so sánh.</div></div>
-     <div style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn" id="viralToReview" disabled>Đưa video đã chọn vào Review</button></div>
+     <h2 class="hero-h">🌐 Dịch phim · tạo phụ đề tiếng Việt</h2>
+     <p class="hero-d">Dán link hoặc tải file video lên. Tool tự nghe lời thoại, dịch theo ngữ cảnh và xuất phụ đề SRT hoặc video đã gắn phụ đề.</p>
+     <form id="f3">
+      <div class="movie-modes">
+       <label class="movie-mode"><input type="radio" name="task_mode" value="translate"><div><b>Dịch phim</b><span>Tạo phụ đề hoặc gắn phụ đề vào toàn bộ phim</span></div></label>
+       <label class="movie-mode"><input type="radio" name="task_mode" value="summary" checked><div><b>Tóm tắt phim</b><span>Rút gọn phim và thuyết minh bằng giọng đã chọn</span></div></label>
+      </div>
+      <div class="sec">
+       <div class="sec-h"><span class="b">1</span> Nguồn phim/video</div>
+       <textarea name="links" placeholder="Dán link YouTube / TikTok / Douyin / Google Drive / Facebook, mỗi dòng 1 link..."></textarea>
+       <label class="drop" id="d3" style="margin-top:8px">📁 hoặc kéo thả / bấm chọn file video<input type="file" name="files" multiple accept="video/*"></label>
+      </div>
+      <div class="sec">
+       <div class="sec-h"><span class="b">2</span> Ngôn ngữ và đầu ra</div>
+       <div class="row2">
+        <div><label>Ngôn ngữ gốc</label><select name="source_language"><option value="">Tự nhận diện</option><option value="zh">Tiếng Trung</option><option value="en">Tiếng Anh</option><option value="ja">Tiếng Nhật</option><option value="ko">Tiếng Hàn</option><option value="th">Tiếng Thái</option><option value="id">Tiếng Indonesia</option><option value="vi">Tiếng Việt</option></select></div>
+        <div><label>Dịch sang</label><select name="target_language" id="movieTargetLanguage"><option value="vi" selected>Tiếng Việt</option><option value="en">Tiếng Anh</option><option value="zh">Tiếng Trung</option></select></div>
+       </div>
+       <div id="translateOptions"><label>Kết quả dịch</label><select name="translation_output"><option value="dub_subtitle" selected>Lồng tiếng Việt + phụ đề Việt</option><option value="dub">Chỉ lồng tiếng Việt</option><option value="both">SRT + toàn bộ phim có phụ đề</option><option value="srt">Chỉ file SRT</option><option value="burn">Chỉ toàn bộ phim có phụ đề</option></select></div>
+       <div id="summaryOptions">
+        <label>Độ dài video tóm tắt</label><select name="summary_minutes"><option value="auto" selected>Tự động · khoảng 1/6 phim (60 phút → 10 phút)</option><option value="5">Khoảng 5 phút</option><option value="10">Khoảng 10 phút</option><option value="15">Khoảng 15 phút</option><option value="20">Khoảng 20 phút</option></select>
+       </div>
+       <div class="row2" style="margin-top:10px"><div><label>Dịch vụ giọng đọc/lồng tiếng</label><select name="tts_provider" data-provider><option value="vivibe">Vivibe</option><option value="genmax">GenMax</option></select></div><div><label>Giọng tiếng Việt</label><select name="voice">%VOICE%</select></div></div>
+       <div style="margin-top:10px"><label>Xử lý phụ đề gốc</label><select name="original_subtitles"><option value="smart_bottom" selected>Xóa thông minh local — phía dưới</option><option value="smart_top">Xóa thông minh local — phía trên</option><option value="bottom">Làm mờ phía dưới (nhanh, chỉ Dịch phim)</option><option value="top">Làm mờ phía trên (nhanh, chỉ Dịch phim)</option><option value="keep">Giữ sub gốc</option></select><p class="d" style="margin-top:6px">Áp dụng cho cả Dịch phim và Tóm tắt phim. Tool nhận diện nét chữ rồi tái tạo nền bằng OpenCV; nếu lỗi sẽ tự làm mờ vùng sub.</p></div>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">3</span> Bắt đầu dịch</div>
+       <button class="btn big-btn" type="submit">✨ Dịch phim — xem ở tab Kết quả</button></div>
+     </form>
     </div>
    </section>
 
@@ -1149,7 +1212,7 @@ https://www.tiktok.com/@.../video/..."></textarea>
    <section class="view" id="v-jobs">
     <div class="results-toolbar">
      <div class="seg" id="filter">
-      <button class="on" data-f="all">Tất cả</button><button data-f="remake">Remake</button><button data-f="review">Review</button>
+      <button class="on" data-f="all">Tất cả</button><button data-f="remake">Remake</button><button data-f="review">Review</button><button data-f="translate">Dịch phim</button>
      </div>
      <span class="meta" id="jcount"></span>
      <div class="seg post-filter" id="postFilter">
@@ -1223,6 +1286,13 @@ https://www.tiktok.com/@.../video/..."></textarea>
        <button class="btn" id="saveGenmax">Lưu API key</button>
       </div>
       <div class="card">
+       <h2>Douyin Cookie</h2><p class="d">Dùng cho link <code>jingxuan?modal_id=...</code> bị Douyin chặn 403. Cookie chỉ lưu cục bộ trong <code>config.json</code>; không chia sẻ cho người khác.</p>
+       <label>Cookie đăng nhập Douyin</label>
+       <input type="password" id="douyinCookie" autocomplete="off" placeholder="Dán toàn bộ Cookie header từ Douyin">
+       <div class="meta" id="douyinCookieState" style="margin:7px 0 10px">Chưa kiểm tra</div>
+       <button class="btn" id="saveDouyinCookie">Lưu Douyin Cookie</button>
+      </div>
+      <div class="card">
        <h2>Vivibe API</h2><p class="d">Key dùng để tạo giọng đọc. Key được lưu cục bộ trong <code>config.json</code>.</p>
        <label>Vivibe API key</label>
        <input type="password" id="vivibeKey" autocomplete="off" placeholder="Dán key sk_live_...">
@@ -1266,16 +1336,13 @@ https://www.tiktok.com/@.../video/..."></textarea>
 <div class="toast" id="toast"></div>
 
 <script>
-const IC={home:'<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/>',remake:'<path d="M4 4v6h6"/><path d="M20 20v-6h-6"/><path d="M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3"/>',review:'<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M10 9l4 2-4 2z"/>',jobs:'<path d="M4 6h16M4 12h16M4 18h10"/>',fbposts:'<path d="M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z"/><path d="M14 8h-2a2 2 0 0 0-2 2v8M8 13h6"/>',set:'<circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.3 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.4 2.5a7 7 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.6a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.3-1a7 7 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7 7 0 0 0 1.7-1l2.3 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/>',log:'<path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'};
+const IC={home:'<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/>',remake:'<path d="M4 4v6h6"/><path d="M20 20v-6h-6"/><path d="M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3"/>',translate:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>',review:'<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M10 9l4 2-4 2z"/>',jobs:'<path d="M4 6h16M4 12h16M4 18h10"/>',fbposts:'<path d="M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z"/><path d="M14 8h-2a2 2 0 0 0-2 2v8M8 13h6"/>',set:'<circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.3 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.4 2.5a7 7 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.6a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.3-1a7 7 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7 7 0 0 0 1.7-1l2.3 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/>',log:'<path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'};
 let ME=null,NAV=[],FB_PAGES=[];
-const HINT={home:"",remake:"1 video → nhiều biến thể",review:"dán link → cắt ghép → video mới",jobs:"video đã làm + tiến trình",fbposts:"xem và quản lý bài trên Page",set:"chỉnh mặc định",log:"",account:"đổi mật khẩu và quản lý tài khoản"};
+const HINT={home:"",remake:"1 video → nhiều biến thể",translate:"nghe lời → dịch → phụ đề",review:"dán link → cắt ghép → video mới",jobs:"video đã làm + tiến trình",fbposts:"xem và quản lý bài trên Page",set:"chỉnh mặc định",log:"",account:"đổi mật khẩu và quản lý tài khoản"};
 const nav=document.getElementById("nav");
-function buildNav(){nav.innerHTML="";NAV=ME.role==="admin"?[["home","Tổng quan"],["fbposts","Bài viết Facebook"],["review","Tạo video"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["set","Cài đặt"],["log","Nhật ký"],["account","Tài khoản"]]:[["home","Tổng quan"],["review","Tạo video"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["account","Tài khoản"]];NAV.forEach(([k,t],i)=>{const d=document.createElement("div");d.className="nav"+(i==0?" on":"");d.dataset.k=k;
+function buildNav(){nav.innerHTML="";NAV=ME.role==="admin"?[["home","Tổng quan"],["fbposts","Bài viết Facebook"],["review","Tạo video"],["translate","Dịch phim"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["set","Cài đặt"],["log","Nhật ký"],["account","Tài khoản"]]:[["home","Tổng quan"],["review","Tạo video"],["translate","Dịch phim"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["account","Tài khoản"]];NAV.forEach(([k,t],i)=>{const d=document.createElement("div");d.className="nav"+(i==0?" on":"");d.dataset.k=k;
  d.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${IC[k]}</svg><span>${t}</span>`+(k=="jobs"?'<span class="badge" id="navq" style="display:none"></span>':'');
  d.onclick=()=>go(k);nav.appendChild(d);});}
-const buildNavBase=buildNav;
-buildNav=function(){buildNavBase();const k="viral",t="Kho video viral";NAV.push([k,t]);const d=document.createElement("div");d.className="nav";d.dataset.k=k;d.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M13 2s1 4-2 6c-2 2-3 4-2 7 1 3 4 4 6 2 2-2 2-5 1-7 3 2 5 5 3 9-2 4-9 4-12 0-3-5 0-10 4-13 0 3 2 5 5 6"/></svg><span>'+t+'</span>';d.onclick=()=>go(k);nav.appendChild(d);};
-HINT.viral="chấm viral · nhóm trùng · gợi ý gốc/reup";
 function go(k){
  document.querySelectorAll(".nav").forEach(n=>n.classList.toggle("on",n.dataset.k==k));
  document.querySelectorAll(".view").forEach(v=>v.classList.remove("on"));
@@ -1299,6 +1366,7 @@ function wireDrop(id){const l=document.getElementById(id);const inp=l.querySelec
  l.ondragleave=()=>l.classList.remove("has");
  l.ondrop=e=>{e.preventDefault();inp.files=e.dataTransfer.files;inp.onchange();};}
 wireDrop("d1");wireDrop("d2");
+wireDrop("d3");
 function syncProviderVoices(providerSelect){const voice=providerSelect.closest("form")?.querySelector('select[name="voice"]');if(!voice)return;const genmax=providerSelect.value==="genmax";[...voice.options].forEach(o=>{const isGenmax=o.value==="adam3"||o.value.startsWith("genmax_");const show=o.value==="auto"||(genmax?isGenmax:!isGenmax);o.hidden=!show;o.disabled=!show;});if(voice.selectedOptions[0]?.disabled)voice.value="auto";}
 document.querySelectorAll("[data-provider]").forEach(el=>{el.addEventListener("change",()=>syncProviderVoices(el));syncProviderVoices(el);});
 
@@ -1313,19 +1381,9 @@ async function submit(form,url,label){
 }
 document.getElementById("f1").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/remake");});
 document.getElementById("f2").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/review");});
-
-/* ===== kho video viral / gốc-reup ===== */
-let VIRAL_ITEMS=[],VIRAL_PICK=new Set();
-const num=v=>Number(v||0).toLocaleString("vi-VN"),originClass=v=>v.includes("bản gốc")?"original":v.includes("reup")?"reup":"";
-function renderViral(){
- const box=document.getElementById("viralResults"),summary=document.getElementById("viralSummary");
- summary.innerHTML=VIRAL_ITEMS.length?`<span class="tag">${VIRAL_ITEMS.length} video</span><span class="tag">${new Set(VIRAL_ITEMS.map(x=>x.group)).size} nhóm nội dung</span><span class="meta">Đã chọn ${VIRAL_PICK.size}</span>`:"";
- box.innerHTML=VIRAL_ITEMS.length?VIRAL_ITEMS.map(v=>`<article class="viral-card ${VIRAL_PICK.has(v.id)?'pick':''}" data-id="${v.id}">${v.thumb?`<img src="${v.thumb}" alt="">`:''}<div class="viral-body"><div class="viral-title" title="${esc(v.title)}">${esc(v.title)}</div><div class="viral-meta">@${esc(v.uploader)} · Nhóm ${v.group} · Viral ${v.viral_score}</div><div class="viral-stats"><div class="viral-stat"><b>${num(v.views)}</b>View</div><div class="viral-stat"><b>${num(v.likes)}</b>Like</div><div class="viral-stat"><b>${num(v.comments)}</b>Comment</div><div class="viral-stat"><b>${num(v.shares)}</b>Share</div></div><span class="origin ${originClass(v.origin_label)}">${esc(v.origin_label)} · ${v.origin_confidence}%</span><div class="viral-meta">${(v.origin_reasons||[]).map(esc).join(" · ")}</div><div class="viral-actions"><button class="btn sm ghost viral-pick">${VIRAL_PICK.has(v.id)?'Bỏ chọn':'Chọn'}</button><a class="btn sm ghost" href="${esc(v.url)}" target="_blank" rel="noopener">Mở nguồn</a></div></div></article>`).join(""):'<div class="empty">Không có video phân tích được.</div>';
- document.getElementById("viralToReview").disabled=!VIRAL_PICK.size;
-}
-document.getElementById("analyzeViral").onclick=async()=>{const button=document.getElementById("analyzeViral"),links=document.getElementById("viralLinks").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);if(!links.length){toast("⚠ Hãy dán link TikTok/Douyin");return;}button.disabled=true;button.innerHTML='<span class="spin"></span> Đang tải & so sánh...';document.getElementById("viralResults").innerHTML='<div class="empty">Đang tải video và tạo dấu vân tay hình ảnh. Có thể mất vài phút...</div>';try{const r=await fetch("/api/viral/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({links})}),d=await r.json();if(!r.ok||!d.ok)throw new Error(d.err||"Phân tích thất bại");VIRAL_ITEMS=d.items||[];VIRAL_PICK=new Set(VIRAL_ITEMS.filter(x=>!x.origin_label.includes("reup")).map(x=>x.id));renderViral();if((d.errors||[]).length)toast(`⚠ ${d.errors.length} link không phân tích được`);else toast("✓ Phân tích hoàn tất");}catch(err){VIRAL_ITEMS=[];renderViral();toast("⚠ "+err.message);}button.disabled=false;button.textContent="🔎 Phân tích";};
-document.getElementById("viralResults").onclick=e=>{const button=e.target.closest(".viral-pick");if(!button)return;const id=button.closest(".viral-card").dataset.id;VIRAL_PICK.has(id)?VIRAL_PICK.delete(id):VIRAL_PICK.add(id);renderViral();};
-document.getElementById("viralToReview").onclick=()=>{const links=VIRAL_ITEMS.filter(x=>VIRAL_PICK.has(x.id)).map(x=>x.url);document.querySelector('#f2 textarea[name="links"]').value=links.join("\n");go("review");toast(`✓ Đã đưa ${links.length} video vào Review`);};
+document.getElementById("f3").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/translate");});
+function syncMovieMode(){const mode=document.querySelector('#f3 input[name="task_mode"]:checked')?.value||"summary",summary=mode==="summary",target=document.getElementById("movieTargetLanguage");document.getElementById("translateOptions").style.display=summary?"none":"";document.getElementById("summaryOptions").style.display=summary?"":"none";if(summary){target.value="vi";target.disabled=true;}else target.disabled=false;}
+document.querySelectorAll('#f3 input[name="task_mode"]').forEach(el=>el.addEventListener("change",syncMovieMode));syncMovieMode();
 
 /* ===== jobs: cập nhật CÓ CHỌN LỌC (chống nháy) ===== */
 let curFilter="all",postFilter="all";
@@ -1340,7 +1398,8 @@ let jobsData=[];
 function jobCardHTML(j){
  const exp=j.expected||0, pct=exp?Math.min(100,Math.round(j.n_out/exp*100)):(j.status=="done"?100:0);
  const showbar=(j.status=="running"||j.status=="queued")&&exp>0;
- return `<div class="h"><span class="kind">${j.kind=="remake"?"🎬 Làm lại":"🎬 Tạo video"}</span>
+ const kindLabel=j.kind==="remake"?"🎬 Làm lại":j.kind==="translate"?"🌐 Dịch phim":"🎬 Tạo video";
+ return `<div class="h"><span class="kind">${kindLabel}</span>
    <span class="badge2 ${BC[j.status]||''}">${BT[j.status]||j.status}</span>
    <span style="margin-left:auto" class="meta">${j.n_in} nguồn → <b style="color:var(--fg)">${j.n_out}${exp?("/"+exp):""}</b> video ${j.product?("· "+j.product):""}</span></div>
    <div class="meta">${j.id} · ${j.created_at||""}${ME.role==="admin"?` · user: ${j.owner||"legacy"}`:""}</div>
@@ -1354,6 +1413,11 @@ async function loadDetail(j){
  if(d.error)h+=`<div class="log" style="color:#ff9a9a">${d.error}</div>`;
  if(d.outputs&&d.outputs.length){h+='<div class="outs">';
   for(const o of d.outputs){
+   if(o.type==="subtitle"||o.type==="text"){
+    const isSrt=o.type==="subtitle",icon=isSrt?"CC":"TXT",downloadLabel=isSrt?"Tải file SRT":"Tải bản tóm tắt";
+    h+=`<div class="out" data-posted="0"><div style="width:160px;min-height:150px;display:grid;place-items:center;background:var(--card2);font-size:38px;font-weight:700">${icon}</div><div class="m"><div class="out-title"><span>${esc(o.san_pham||o.label||"Tài liệu")}</span></div><div class="out-tags"><span class="tag">${esc(o.label||"Tài liệu")}</span>${isSrt?`<span class="tag">${o.segments||0} đoạn</span>`:""}</div><a class="dl" href="/out/${j.id}/${o.file}" download>↓ ${downloadLabel}</a></div></div>`;
+    continue;
+   }
    const sceneCounts={};(o.canh||[]).forEach(c=>sceneCounts[c]=(sceneCounts[c]||0)+1);
    const sceneTags=Object.entries(sceneCounts).map(([c,n])=>`<span class="tag">${esc(c)}${n>1?` ×${n}`:""}</span>`).join("");
    const tags=(o.kich_ban?`<span class="tag" style="background:#dcefeb;color:#066b67">${o.kich_ban}</span>`:"")+
@@ -1480,6 +1544,7 @@ async function loadSettings(){const r=await fetch("/api/settings");const s=await
  if(s.tts_provider==="vivibe")document.querySelectorAll('select[name="voice"],[data-s="voice"],[data-s="review_voice"]').forEach(el=>{if(el.value==="adam3")el.value="auto";});
  const ks=document.getElementById("vivibeKeyState");if(ks)ks.textContent=s.vivibe_key_set?"✅ Đã có API key":"⚠ Chưa có API key";
  const gs=document.getElementById("genmaxKeyState");if(gs)gs.textContent=s.genmax_key_set?"✅ Đã có API key":"⚠ Chưa có API key";
+ const ds=document.getElementById("douyinCookieState");if(ds)ds.textContent=s.douyin_cookie_set?"✅ Đã có Douyin Cookie":"⚠ Chưa có Douyin Cookie";
  FB_PAGES=s.facebook_pages||[];syncPostsPages();const fs=document.getElementById("facebookState");if(fs)fs.textContent=FB_PAGES.length?`✅ Đã cấu hình ${FB_PAGES.length} Page`:"⚠ Chưa có Facebook Page";renderFacebookPages();}
 function renderFacebookPages(){const box=document.getElementById("facebookPageList");if(!box)return;box.innerHTML=FB_PAGES.length?FB_PAGES.map(p=>`<div class="fb-page-row"><span><b>${esc(p.name||p.id)}</b><small>${esc(p.id)}</small></span><button class="btn sm ghost test-fb-page" data-id="${esc(p.id)}">Kiểm tra</button><button class="btn sm ghost delete-fb-page" data-id="${esc(p.id)}">Xoá</button></div>`).join(""):'<div class="meta">Chưa thêm Page nào.</div>';}
 document.getElementById("saveSet").onclick=async()=>{
@@ -1491,6 +1556,7 @@ document.getElementById("saveVivibe").onclick=async()=>{const el=document.getEle
  const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vivibe_api_key:key})});
  const s=await r.json();if(s.vivibe_key_set){el.value="";toast("✅ Đã lưu Vivibe API key");loadSettings();}else toast("⚠ Không lưu được API key");};
 document.getElementById("saveGenmax").onclick=async()=>{const el=document.getElementById("genmaxKey"),key=el.value.trim();if(!key){toast("⚠ Hãy dán GenMax API key");return;}const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genmax_api_key:key})}),s=await r.json();if(s.genmax_key_set){el.value="";toast("✅ Đã lưu GenMax API key");loadSettings();document.getElementById("credits").dataset.loaded="";}else toast("⚠ Không lưu được API key");};
+document.getElementById("saveDouyinCookie").onclick=async()=>{const el=document.getElementById("douyinCookie"),cookie=el.value.trim();if(!cookie){toast("⚠ Hãy dán Douyin Cookie");return;}const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({douyin_cookie:cookie})}),s=await r.json();if(s.douyin_cookie_set){el.value="";toast("✅ Đã lưu Douyin Cookie");loadSettings();}else toast("⚠ Không lưu được Douyin Cookie");};
 document.getElementById("saveFacebook").onclick=async()=>{const pageId=document.getElementById("facebookPageId").value.trim(),pageName=document.getElementById("facebookPageName").value.trim(),token=document.getElementById("facebookToken").value.trim();if(!pageId){toast("⚠ Hãy nhập Page ID");return;}const payload={facebook_page_id:pageId,facebook_page_name:pageName};if(token)payload.facebook_page_access_token=token;const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const s=await r.json();if(s.facebook_key_set){document.getElementById("facebookToken").value="";document.getElementById("facebookPageId").value="";document.getElementById("facebookPageName").value="";toast("✅ Đã lưu Facebook Page");await loadSettings();Object.keys(sigCache).forEach(k=>delete sigCache[k]);renderJobs(true);}else toast("⚠ Page mới cần Page Access Token");};
 document.getElementById("facebookPageList").onclick=async e=>{const test=e.target.closest(".test-fb-page"),del=e.target.closest(".delete-fb-page");if(test){test.disabled=true;const r=await fetch("/api/facebook/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({page_id:test.dataset.id})});const s=await r.json();test.disabled=false;toast(s.ok?`✅ Đã kết nối: ${s.page_name}`:`⚠ ${s.err||"Kết nối thất bại"}`);}if(del&&confirm("Xoá Page này khỏi tool?")){await fetch("/api/facebook/pages/"+encodeURIComponent(del.dataset.id),{method:"DELETE"});await loadSettings();Object.keys(sigCache).forEach(k=>delete sigCache[k]);renderJobs(true);}};
 fetch("/api/overview").then(r=>r.json()).then(o=>{const e=document.getElementById("outdir");if(e)e.textContent=o.out_dir||"output/";});
