@@ -6,6 +6,8 @@ httpx==0.28.1
 # Tải Facebook/Reels và fallback khi TikWM không nhận link
 yt-dlp
 curl_cffi
+# Dùng Chrome/Cốc Cốc/Edge đã cài để đăng nhập và đọc trang Khám phá video.
+playwright==1.55.0
 # Tải file video từ link Google Drive công khai
 gdown
 # Nghe lời video nguồn (Whisper) — kéo theo ctranslate2, onnxruntime, numpy, tokenizers, av

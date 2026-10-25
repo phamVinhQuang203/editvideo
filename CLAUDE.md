@@ -56,7 +56,7 @@ video-studio/
   requirements.txt            Gói core
   requirements-optional.txt   Gói nặng tuỳ chọn
   check_env.py                Kiểm tra môi trường (--fix tự cài pip)
-  setup.cmd / start-studio.cmd / start-studio-hidden.vbs
+  setup.cmd / start-studio.cmd
   input/ output/ jobs/ work/ logs/ analysis_cache/   (tự tạo lúc chạy)
 ```
 

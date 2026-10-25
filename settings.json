@@ -1,11 +1,11 @@
 {
  "niche": "gia-dung",
- "voice": "adam3",
+ "voice": "auto",
  "hook": "auto",
  "flip": "auto",
  "style": "auto",
  "n_variants": 1,
- "review_voice": "adam3",
+ "review_voice": "genmax_minimax_serene_man",
  "review_hook": "auto",
  "review_style": "auto",
  "review_n": 1,

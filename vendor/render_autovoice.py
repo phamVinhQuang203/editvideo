@@ -445,15 +445,30 @@ def run_genmax_tts_with_retry(text: str, voice_id: str, raw_voice: Path, attempt
     api_key = os.environ.get("GENMAX_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Missing GENMAX_API_KEY.")
-    model = os.environ.get("GENMAX_MODEL", "eleven_v3")
+    voice_id = str(voice_id).strip()
+    if voice_id.startswith("Vietnamese_"):
+        upstream_provider = "minimax"
+    else:
+        upstream_provider = "capcut" if voice_id.isdigit() else "elevenlabs"
+    if upstream_provider == "capcut":
+        model = "capcut"
+    elif upstream_provider == "minimax":
+        model = os.environ.get("GENMAX_MINIMAX_MODEL", "speech-2.6-hd")
+    else:
+        model = os.environ.get("GENMAX_MODEL", "eleven_v3")
     speed = float(os.environ.get("GENMAX_SPEED", "1.05") or 1.05)
-    payload = {
-        "text": text, "model_id": model, "provider": "elevenlabs",
-        "language_code": "vi",
-        "voice_settings": {
+    if upstream_provider in {"capcut", "minimax"}:
+        voice_settings = {"speed": speed, "pitch": 0}
+    else:
+        voice_settings = {
             "stability": 0.5, "similarity_boost": 0.82, "style": 0.55,
             "use_speaker_boost": True, "speed": speed,
-        },
+        }
+    # MiniMax lấy ngữ điệu từ dấu câu; các tag kiểu ElevenLabs có thể bị đọc thành lời.
+    tts_text = re.sub(r"\[(?:[^\]\r\n]{1,40})\]\s*", "", text) if upstream_provider == "minimax" else text
+    payload = {
+        "text": tts_text, "model_id": model, "provider": upstream_provider,
+        "language_code": "vi", "voice_settings": voice_settings,
     }
     headers = {
         "xi-api-key": api_key, "Content-Type": "application/json",
@@ -486,7 +501,8 @@ def run_genmax_tts_with_retry(text: str, voice_id: str, raw_voice: Path, attempt
                         raise RuntimeError("GenMax completed without audio_url")
                     download_url(audio_url, raw_voice)
                     if raw_voice.exists() and raw_voice.stat().st_size > 1024:
-                        return {"taskId": task_id, "url": audio_url, "model": model}
+                        return {"taskId": task_id, "url": audio_url, "model": model,
+                                "upstreamProvider": upstream_provider}
                     raise RuntimeError("GenMax produced an empty audio file")
                 if state in {"failed", "error"}:
                     raise RuntimeError(status.get("detail_error") or status.get("error") or state)

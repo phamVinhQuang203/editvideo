@@ -10,6 +10,8 @@ Gộp shot theo vai -> ráp M kịch bản cảnh khác nhau -> concat -> blur -
 """
 import os, re, time, json, random, shutil, subprocess, traceback
 import engine as E
+import translate as T
+from hook_skill import TIKTOK_HOOK_3S_SKILL
 
 RENDER_SEG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render_segmented_vivibe.py")
 FONT = "C\\:/Windows/Fonts/arial.ttf"     # cho drawtext đánh số shot
@@ -109,7 +111,8 @@ def classify_shots(mon, shots, seg_by_shot, product, niche):
 Ảnh montage đính kèm: mỗi ô có SỐ = shot đó (khớp danh sách dưới).
 {chr(10).join(lines)}
 Với MỖI shot, gán VAI trong luồng review:
-- hook: cảnh gây chú ý 3s đầu (vấn đề nhức nhối / kết quả bất ngờ / cảnh lạ mắt)
+- hook: cảnh có thể làm visual stopper ở 0-1 giây (chuyển động / kết quả / chi tiết lạ / tương phản),
+  đồng thời đặt được câu hỏi tò mò và có payoff thật ở các shot sau
 - problem: cảnh cho thấy VẤN ĐỀ trước khi dùng sản phẩm
 - demo: cảnh THAO TÁC/DÙNG sản phẩm
 - feature: cảnh khoe TÍNH NĂNG/chi tiết sản phẩm (cận cảnh, cấu tạo)
@@ -119,7 +122,10 @@ Với MỖI shot, gán VAI trong luồng review:
 - filler: chuyển cảnh/logo/không giá trị
 Với mỗi shot, thêm co_nguoi=true nếu thấy rõ mặt hoặc thân người. Nếu chỉ thấy bàn tay/cánh tay thao tác sản phẩm thì co_nguoi=false.
 Trả DUY NHẤT 1 JSON: {{"shots":[{{"i":1,"vai":"hook","mo_ta":"<mô tả cảnh 1 câu tiếng Việt>","diem":0-10,"ro_san_pham":true|false,"co_nguoi":true|false}}, ...]}}
-diem = độ ĐẮT của shot để đưa vào review (cảnh rõ, đẹp, thuyết phục = cao). Đủ tất cả shot theo số."""
+diem = độ ĐẮT của shot để đưa vào review (cảnh rõ, đẹp, thuyết phục = cao). Riêng vai hook,
+ưu tiên khả năng chặn lướt trong 1 giây đầu và sự liên quan thật với phần thân video.
+{TIKTOK_HOOK_3S_SKILL}
+Đủ tất cả shot theo số."""
     j = E.codex_json(prompt, image=mon, effort="low", timeout=180) or {}
     out = j.get("shots") or []
     by_i = {int(x.get("i", 0)): x for x in out if isinstance(x, dict)}
@@ -332,13 +338,15 @@ def review_script_fw(product, plan, fw, facts, dur, niche, contact=None, hook_ty
            "feature":"tính năng","result":"kết quả","cta":"chốt"}
     flow_txt = " → ".join(f"{VAI.get(c['vai'],c['vai'])}" + (f" ({c['mo_ta']})" if c.get("mo_ta") else "")
                           for c in plan)
-    address_rule = (
-        'XƯNG HÔ BẮT BUỘC: người nói xưng "tao", gọi người xem là "mày" hoặc "chúng mày". '
-        'Giữ đúng hệ xưng hô này từ đầu tới cuối.'
-        if address_style % 2 == 0 else
-        'XƯNG HÔ BẮT BUỘC: người nói xưng "anh", gọi người xem linh hoạt là "các vợ yêu" hoặc '
-        '"các con vợ". Giữ đúng hệ xưng hô này từ đầu tới cuối.'
+    polite_addresses = (
+        'XƯNG HÔ BẮT BUỘC: người nói xưng "mình", gọi người xem là "bạn". '
+        'Giữ tự nhiên và nhất quán từ đầu tới cuối.',
+        'XƯNG HÔ BẮT BUỘC: người nói xưng "mình", gọi người xem là "các bạn". '
+        'Giữ thân thiện và nhất quán từ đầu tới cuối.',
+        'XƯNG HÔ BẮT BUỘC: người nói xưng "mình", gọi người xem là "mọi người". '
+        'Giữ gần gũi và nhất quán từ đầu tới cuối.',
     )
+    address_rule = polite_addresses[address_style % len(polite_addresses)]
     # LỜI GỐC từ chính video nguồn (các cảnh đã chọn) -> HỌC điểm bán + cách nói thật -> chống 1 màu
     orig = " ".join((c.get("loi") or "").strip() for c in plan if (c.get("loi") or "").strip())
     orig = " ".join(orig.split())[:900]
@@ -352,13 +360,20 @@ CẤU TRÚC BẮT BUỘC (bám sát): {fw['structure']}{hook_line}{facts_block}{
 Video chạy qua các cảnh theo thứ tự: {flow_txt}{orig_block}
 {address_rule}
 
+{TIKTOK_HOOK_3S_SKILL}
+Hãy âm thầm tạo 5 hook, chấm đủ 5 tiêu chí và chọn hook tốt nhất trước khi viết. Chỉ xuất
+lời thoại hoàn chỉnh của phương án thắng; không in danh sách ứng viên, bảng điểm hay giải thích.
+
 NGUYÊN TẮC QUAN TRỌNG (đọc kỹ):
+- CẤM dùng cách xưng hô "tao – mày", "chúng mày", "các con vợ", "các vợ yêu".
 - Nội dung bám LỜI GỐC + facts sản phẩm ở trên (đúng sản phẩm này), KHÔNG viết chung chung.
 - MỞ bằng HOOK đúng kiểu yêu cầu rồi dẫn tới sản phẩm; nói CÔNG NĂNG / LỢI ÍCH thật khi dùng.
 - KHÔNG sa đà tả chi tiết hình ảnh vụn vặt; nói về GIÁ TRỊ sản phẩm.
 - BÁM CẢNH: mỗi ý thoại phải khớp cảnh đang chiếu theo thứ tự; nói đúng điều cảnh đó minh hoạ.
 - NHỊP NHANH, CÓ LỰC: hook vào thẳng, mạnh, gọn; nhấn keyword; câu ngắn, chuyển ý gọn; ít khoảng nghỉ; CTA dứt khoát.
-- VIẾT CHO TTS: nối các ý liên quan thành một mạch; dấu phẩy chỉ nghỉ rất ngắn; hạn chế dấu chấm và xuống dòng gây khoảng lặng dài.
+- VIẾT CHO TTS: giữ một mạch nhưng phải có nhấn nhá; xen câu ngắn và câu vừa, dùng dấu phẩy
+  để nghỉ nhẹ, dấu ba chấm cho điểm chờ, dấu hỏi/cảm thán ở hook hoặc điểm bất ngờ. Không
+  viết hoa cả câu, không kéo dài mọi câu và không để giọng đều đều như đọc văn bản.
 - CÁCH ĐỌC BẮT BUỘC: "3in1" viết thành "ba in một"; số giá dạng "139K" viết thành "139 nghìn"; thương hiệu "TIAN" viết thành "Ti An".
 - PHONG CÁCH ADAM – DOMINANT, FIRM: tự nhiên, chắc giọng, dí dỏm như đang kể chuyện cho bạn bè; nhấn cảm xúc rõ ở hook, điểm bất ngờ và CTA.
 - Tạo 2-4 điểm cảm xúc bằng lời nói thật như "Ê!", "Ủa?", "Trời ơi!", "Ha ha", "hì hì", "đó nhaaa"; có thể kéo nhẹ nguyên âm ở từ cảm thán nhưng không lạm dụng.
@@ -369,6 +384,32 @@ NGUYÊN TẮC QUAN TRỌNG (đọc kỹ):
     return E.codex(prompt, effort="medium")   # medium -> lời đa dạng hơn (low bị 1 màu)
 
 # ================= MAIN =================
+def prepare_subtitle_source(assembled, workdir, mode, legacy_blur=False, progress=None, suffix="0"):
+    mode = str(mode or ("smart_bottom" if legacy_blur else "keep")).lower()
+    if mode not in ("keep", "bottom", "top", "smart_bottom", "smart_top"):
+        mode = "smart_bottom"
+    if mode == "keep":
+        return assembled
+    position = "top" if mode.endswith("top") else "bottom"
+    blurred_path = os.path.join(workdir, f"assembled_subtitles_blurred_{suffix}.mp4")
+    if mode in ("smart_bottom", "smart_top"):
+        clean_path = os.path.join(workdir, f"assembled_without_subtitles_{suffix}.mp4")
+        if progress: progress("Đang xóa sub gốc bằng OpenCV local...")
+        if T.clean_original_subtitles(assembled, clean_path, position):
+            if progress: progress("Đã xóa sub gốc")
+            return clean_path
+        if progress: progress("Xóa thông minh lỗi, chuyển sang làm mờ vùng sub...")
+    elif progress:
+        progress("Đang làm mờ vùng sub...")
+    return blurred_path if T.blur_original_subtitles(assembled, blurred_path, position) else assembled
+
+
+def prepare_audio(remove_original_audio=False):
+    if remove_original_audio:
+        return {"original": 0.0, "bed": None, "bedvol": 0.0}
+    return {"original": 0.05, "bed": None, "bedvol": 0.07}
+
+
 def run_review(job, save):
     o = job["opts"]; niche = o.get("niche","co-khi")
     M = int(o.get("n_variants", 3))
@@ -442,11 +483,14 @@ def run_review(job, save):
             E.log(f"[{job['id']}] bản {m+1}: concat FAIL -> bỏ", job); save(job); continue
         dur = E.probe(assembled)
 
-        # BLUR chữ Trung chỉ cần cho nguồn Douyin (TikTok Việt không có) -> mặc định TẮT. Tính 1 lần.
-        do_blur = str(o.get("blur","")).lower() in ("1","on","true","yes","có")
-        blur = E.blur_regions(assembled, wd) if do_blur else []
-        if blur: E.log(f"[{job['id']}] bản {m+1}: blur {len(blur)//2} vùng chữ TQ", job); save(job)
-        au = {"original": 0.05, "bed": None, "bedvol": 0.07}
+        # Dùng cùng cơ chế xóa sub của Dịch phim: OpenCV Telea và fallback FFmpeg blur.
+        legacy_blur = str(o.get("blur", "")).lower() in ("1", "on", "true", "yes", "có")
+        subtitle_mode = str(o.get("original_subtitles") or ("smart_bottom" if legacy_blur else "keep")).lower()
+        def subtitle_progress(message):
+            E.log(f"[{job['id']}] bản {m+1}: {message}", job); save(job)
+        render_source = prepare_subtitle_source(assembled, wd, subtitle_mode, legacy_blur,
+                                                subtitle_progress, str(m))
+        au = prepare_audio(bool(o.get("remove_original_audio")))
 
         # ===== 2b: NHIỀU PHIÊN BẢN HOOK cho cùng video ghép (giống autopilot) =====
         # Mỗi phiên bản = 1 kiểu hook mở đầu khác + giọng khác -> lời khác hẳn, video ghép dùng chung.
@@ -461,7 +505,7 @@ def run_review(job, save):
             sp = os.path.join(wd, f"script_{hi}.txt"); open(sp, "w", encoding="utf-8").write(script)
             outfn = f"review_{m+1}_{hk}.mp4" if hv > 1 else f"review_{m+1}.mp4"
             dstp = os.path.join(outdir, outfn)
-            r = E.render(assembled, sp, dstp, voice_id, au, blur_args=blur, workdir=wd)
+            r = E.render(render_source, sp, dstp, voice_id, au, workdir=wd)
             if not r["ok"]:
                 if r.get("err") == "vivibe_credit":
                     job["status"] = "error"; job["error"] = "Vivibe hết credit — nạp rồi chạy lại."; save(job); return

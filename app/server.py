@@ -2,7 +2,7 @@
 """VIDEO STUDIO — web dashboard (port 7995). KHÔNG đăng bài, chỉ LÀM video.
 Nhánh 1 Remake (link/file -> biến thể) + Nhánh 2 Review (một hoặc nhiều video -> ghép review).
 1 worker chạy TUẦN TỰ (1 job/lúc) -> máy không nóng."""
-import os, io, sys, json, time, uuid, shutil, threading, queue, secrets, re
+import os, io, sys, json, time, uuid, shutil, threading, queue, secrets, re, subprocess
 
 # Chỉ cho phép một Video Studio chạy trên Windows. Nhiều tiến trình cùng cổng
 # có thể nhận job luân phiên với môi trường/PATH khác nhau và gây lỗi khó đoán.
@@ -24,7 +24,7 @@ else:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine as E
-import remake, review, translate
+import discovery, remake, review, soundtrack, translate
 from flask import Flask, request, jsonify, send_from_directory, Response, session, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -257,6 +257,18 @@ def save_douyin_cookie(cookie):
     os.environ["DOUYIN_COOKIE"] = cookie
     return True
 
+def save_bilibili_cookie(cookie):
+    cookie = str(cookie or "").strip()
+    if not cookie or "\r" in cookie or "\n" in cookie: return False
+    p = os.path.join(E.ROOT, "config.json")
+    try: cfg = json.load(open(p, encoding="utf-8"))
+    except Exception: cfg = {}
+    cfg["bilibili_cookie"] = cookie
+    json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    E.CONFIG.update(cfg)
+    os.environ["BILIBILI_COOKIE"] = cookie
+    return True
+
 def facebook_pages():
     pages = [p for p in (E.CONFIG.get("facebook_pages") or [])
              if isinstance(p, dict) and p.get("id") and p.get("access_token")]
@@ -303,6 +315,7 @@ def delete_facebook_page(page_id):
     E.CONFIG.update(cfg)
 
 JOBQ = queue.Queue()
+JOB_STATE_LOCK = threading.Lock()
 
 def worker():
     while True:
@@ -320,8 +333,12 @@ def worker():
                 remake.run_safe(job, E.save_job)
             elif job["kind"] == "review":
                 review.run_safe(job, E.save_job)
-            elif job["kind"] == "translate":
+            elif job["kind"] in ("translate", "reup"):
                 translate.run_safe(job, E.save_job)
+            elif job["kind"] == "movie_studio":
+                translate.run_movie_studio(job, E.save_job)
+            elif job["kind"] == "soundtrack":
+                soundtrack.run_safe(job, E.save_job)
             else:
                 raise ValueError(f"Loại job không hợp lệ: {job['kind']}")
         except Exception as e:
@@ -369,7 +386,8 @@ def _collect():
         "specs": request.form.get("specs","").strip(),
         "price": request.form.get("price","").strip(),
         "cta":   request.form.get("cta","").strip(),
-        "blur":  request.form.get("blur",""),      # che chữ Trung (chỉ cần nguồn Douyin)
+        "blur":  request.form.get("blur",""),      # tương thích các job cũ
+        "original_subtitles": request.form.get("original_subtitles", "keep"),
         "exclude_people": request.form.get("exclude_people", ""),
         "hook_variants": int(request.form.get("hook_variants","1") or 1),  # số phiên bản hook/video
     }
@@ -378,6 +396,7 @@ def _collect():
 @app.post("/api/remake")
 def api_remake():
     inputs, opts = _collect()
+    opts["remove_original_audio"] = request.form.get("remove_original_audio") == "1"
     if not inputs: return jsonify({"ok": False, "err": "Chưa có link/file nào"}), 400
     if opts.get("product_link") and not re.match(r"^https?://", opts["product_link"], re.I):
         return jsonify({"ok": False, "err": "Link affiliate Shopee không hợp lệ"}), 400
@@ -392,6 +411,7 @@ def api_remake():
 @app.post("/api/review")
 def api_review():
     inputs, opts = _collect()
+    opts["remove_original_audio"] = request.form.get("remove_original_audio") == "1"
     if not inputs:
         return jsonify({"ok": False, "err": "Chưa có link/file nào để review"}), 400
     if opts.get("product_link") and not re.match(r"^https?://", opts["product_link"], re.I):
@@ -416,23 +436,56 @@ def api_translate():
         return jsonify({"ok": False, "err": "Chế độ xử lý không hợp lệ"}), 400
     if task_mode == "summary":
         target_language = "vi"
-    output_mode = (str(request.form.get("translation_output") or "both").strip().lower()
+    requested_output = str(request.form.get("translation_output") or "").strip().lower()
+    output_mode = ((requested_output or ("original" if target_language == "none" else "both"))
                    if task_mode == "translate" else "summary")
     original_subtitles = str(request.form.get("original_subtitles") or "smart_bottom").strip().lower()
+    video_speed = str(request.form.get("video_speed") or "1").strip()
+    movie_flip = str(request.form.get("movie_flip") or "none").strip().lower()
+    movie_title = " ".join(str(request.form.get("movie_title") or "").split())[:160]
+    subtitle_font_size = str(request.form.get("subtitle_font_size") or "18").strip()
+    subtitle_font_color = str(request.form.get("subtitle_font_color") or "#ffffff").strip().upper()
+    subtitle_outline_color = str(request.form.get("subtitle_outline_color") or "#101010").strip().upper()
     if source_language not in ("", *translate.LANGUAGES.keys()):
         return jsonify({"ok": False, "err": "Ngôn ngữ nguồn không hợp lệ"}), 400
-    if target_language not in translate.LANGUAGES:
+    if target_language not in ("none", *translate.LANGUAGES.keys()):
         return jsonify({"ok": False, "err": "Ngôn ngữ đích không hợp lệ"}), 400
-    if output_mode not in ("srt", "burn", "both", "summary", "all", "dub", "dub_subtitle"):
+    if output_mode not in ("original", "srt", "burn", "both", "dub", "dub_srt", "summary", "all"):
         return jsonify({"ok": False, "err": "Kiểu đầu ra không hợp lệ"}), 400
-    if original_subtitles not in ("keep", "bottom", "top", "smart_bottom", "smart_top"):
+    if output_mode == "original" and target_language != "none":
+        return jsonify({"ok": False, "err": "Giữ nguyên video gốc chỉ dùng khi chọn Không dịch"}), 400
+    wants_dub = output_mode in ("dub", "dub_srt", "all")
+    if wants_dub and target_language != "vi":
+        return jsonify({"ok": False, "err": "Lồng tiếng hiện chỉ hỗ trợ tiếng Việt"}), 400
+    if original_subtitles not in ("keep", "bottom", "top", "smart_bottom", "smart_top", "smart_custom"):
         return jsonify({"ok": False, "err": "Vị trí phụ đề gốc không hợp lệ"}), 400
+    subtitle_region = None
+    if original_subtitles == "smart_custom":
+        try:
+            subtitle_region = [round(float(request.form.get(key)), 2)
+                               for key in ("subtitle_region_x", "subtitle_region_y",
+                                           "subtitle_region_width", "subtitle_region_height")]
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "err": "Vùng phụ đề tùy chỉnh không hợp lệ"}), 400
+        x, y, width, height = subtitle_region
+        if min(x, y) < 0 or min(width, height) <= 0 or x + width > 100 or y + height > 100:
+            return jsonify({"ok": False, "err": "Vùng phụ đề phải nằm trong khung hình 0–100%"}), 400
+    if video_speed not in ("0.75", "1", "1.25", "1.5", "2"):
+        return jsonify({"ok": False, "err": "Tốc độ video không hợp lệ"}), 400
+    if movie_flip not in ("none", "hflip"):
+        return jsonify({"ok": False, "err": "Kiểu lật hình không hợp lệ"}), 400
+    if not subtitle_font_size.isdigit() or not 12 <= int(subtitle_font_size) <= 48:
+        return jsonify({"ok": False, "err": "Cỡ chữ phụ đề phải từ 12 đến 48"}), 400
+    if not re.fullmatch(r"#[0-9A-F]{6}", subtitle_font_color):
+        return jsonify({"ok": False, "err": "Màu chữ phụ đề không hợp lệ"}), 400
+    if not re.fullmatch(r"#[0-9A-F]{6}", subtitle_outline_color):
+        return jsonify({"ok": False, "err": "Màu viền phụ đề không hợp lệ"}), 400
     summary_minutes = str(request.form.get("summary_minutes") or "auto").strip().lower()
     if summary_minutes not in ("auto", "5", "10", "15", "20"):
         return jsonify({"ok": False, "err": "Thời lượng tóm tắt không hợp lệ"}), 400
     provider = str(request.form.get("tts_provider") or E.CONFIG.get("tts_provider") or "vivibe").lower()
     voice = str(request.form.get("voice") or "auto").strip()
-    if task_mode == "summary" or output_mode in ("dub", "dub_subtitle"):
+    if task_mode == "summary" or wants_dub:
         if provider not in ("genmax", "vivibe"):
             return jsonify({"ok": False, "err": "Dịch vụ giọng đọc không hợp lệ"}), 400
         if provider == "genmax" and not (os.environ.get("GENMAX_API_KEY") or E.CONFIG.get("genmax_api_key")):
@@ -442,16 +495,330 @@ def api_translate():
     opts = {"source_language": source_language, "target_language": target_language,
             "task_mode": task_mode, "output_mode": output_mode, "make_summary": task_mode == "summary",
             "summary_minutes": summary_minutes, "tts_provider": provider, "voice": voice,
-            "original_subtitles": original_subtitles}
+            "original_subtitles": original_subtitles, "subtitle_region": subtitle_region,
+            "video_speed": float(video_speed),
+            "movie_flip": movie_flip, "movie_title": movie_title,
+            "subtitle_font_size": int(subtitle_font_size),
+            "subtitle_font_color": subtitle_font_color,
+            "subtitle_outline_color": subtitle_outline_color}
     return jsonify({"ok": True, "id": _make_job("translate", inputs, opts)})
+
+
+@app.post("/api/movie-studio")
+def api_movie_studio_create():
+    inputs, _ = _collect()
+    if not inputs:
+        return jsonify({"ok": False, "err": "Chưa có link/file phim cần biên tập"}), 400
+    source_language = str(request.form.get("source_language") or "").strip().lower()
+    target_language = str(request.form.get("target_language") or "vi").strip().lower()
+    task_mode = str(request.form.get("task_mode") or "translate").strip().lower()
+    if task_mode not in ("translate", "summary"):
+        return jsonify({"ok": False, "err": "Chế độ xử lý không hợp lệ"}), 400
+    if source_language not in ("", *translate.LANGUAGES.keys()):
+        return jsonify({"ok": False, "err": "Ngôn ngữ nguồn không hợp lệ"}), 400
+    if target_language not in ("none", *translate.LANGUAGES.keys()):
+        return jsonify({"ok": False, "err": "Ngôn ngữ đích không hợp lệ"}), 400
+    if task_mode == "summary":
+        target_language = "vi"
+    output_mode = (str(request.form.get("translation_output") or "both").strip().lower()
+                   if task_mode == "translate" else "summary")
+    if output_mode not in ("srt", "burn", "both", "dub", "dub_srt", "summary", "all"):
+        return jsonify({"ok": False, "err": "Kiểu đầu ra không hợp lệ"}), 400
+    original_subtitles = str(request.form.get("original_subtitles") or "smart_bottom").strip().lower()
+    if original_subtitles not in ("keep", "bottom", "top", "smart_bottom", "smart_top", "smart_custom"):
+        return jsonify({"ok": False, "err": "Vị trí phụ đề gốc không hợp lệ"}), 400
+    subtitle_region = None
+    subtitle_frame_ratio = str(request.form.get("subtitle_frame_ratio") or "16:9").strip()
+    if subtitle_frame_ratio not in ("9:16", "16:9", "1:1", "4:3", "3:4"):
+        return jsonify({"ok": False, "err": "Tỷ lệ khung hình mẫu không hợp lệ"}), 400
+    if original_subtitles == "smart_custom":
+        try:
+            subtitle_region = [round(float(request.form.get(key)), 2)
+                               for key in ("subtitle_region_x", "subtitle_region_y",
+                                           "subtitle_region_width", "subtitle_region_height")]
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "err": "Vùng phụ đề tùy chỉnh không hợp lệ"}), 400
+        x, y, width, height = subtitle_region
+        if min(x, y) < 0 or min(width, height) <= 0 or x + width > 100 or y + height > 100:
+            return jsonify({"ok": False, "err": "Vùng phụ đề phải nằm trong khung hình 0–100%"}), 400
+    video_speed = str(request.form.get("video_speed") or "1").strip()
+    movie_flip = str(request.form.get("movie_flip") or "none").strip().lower()
+    if video_speed not in ("0.75", "1", "1.25", "1.5", "2") or movie_flip not in ("none", "hflip"):
+        return jsonify({"ok": False, "err": "Tùy chỉnh video không hợp lệ"}), 400
+    summary_minutes = str(request.form.get("summary_minutes") or "auto").strip().lower()
+    if summary_minutes not in ("auto", "5", "10", "15", "20"):
+        return jsonify({"ok": False, "err": "Thời lượng tóm tắt không hợp lệ"}), 400
+    provider = str(request.form.get("tts_provider") or E.CONFIG.get("tts_provider") or "vivibe").lower()
+    wants_dub = task_mode == "summary" or output_mode in ("dub", "dub_srt", "all")
+    if wants_dub and provider not in ("genmax", "vivibe"):
+        return jsonify({"ok": False, "err": "Dịch vụ giọng đọc không hợp lệ"}), 400
+    if wants_dub and provider == "genmax" and not (os.environ.get("GENMAX_API_KEY") or E.CONFIG.get("genmax_api_key")):
+        return jsonify({"ok": False, "err": "Chưa cấu hình GenMax API key"}), 400
+    if wants_dub and provider == "vivibe" and not (os.environ.get("VIVIBE_API_KEY") or E.CONFIG.get("vivibe_api_key")):
+        return jsonify({"ok": False, "err": "Chưa cấu hình Vivibe API key"}), 400
+    font_size = str(request.form.get("subtitle_font_size") or "18").strip()
+    font_color = str(request.form.get("subtitle_font_color") or "#ffffff").strip().upper()
+    outline_color = str(request.form.get("subtitle_outline_color") or "#101010").strip().upper()
+    if not font_size.isdigit() or not 12 <= int(font_size) <= 48:
+        return jsonify({"ok": False, "err": "Cỡ chữ phụ đề phải từ 12 đến 48"}), 400
+    if not re.fullmatch(r"#[0-9A-F]{6}", font_color) or not re.fullmatch(r"#[0-9A-F]{6}", outline_color):
+        return jsonify({"ok": False, "err": "Màu phụ đề không hợp lệ"}), 400
+    opts = {
+        "phase": "prepare", "source_language": source_language,
+        "target_language": target_language, "task_mode": task_mode,
+        "output_mode": output_mode, "make_summary": task_mode == "summary",
+        "summary_minutes": summary_minutes, "tts_provider": provider,
+        "voice": str(request.form.get("voice") or "auto").strip(),
+        "original_subtitles": original_subtitles, "subtitle_region": subtitle_region,
+        "subtitle_frame_ratio": subtitle_frame_ratio,
+        "video_speed": float(video_speed),
+        "movie_flip": movie_flip,
+        "movie_title": " ".join(str(request.form.get("movie_title") or "").split())[:160],
+        "subtitle_font_size": int(font_size), "subtitle_font_color": font_color,
+        "subtitle_outline_color": outline_color,
+    }
+    jid = _make_job("movie_studio", inputs, opts)
+    return jsonify({"ok": True, "id": jid})
+
+
+def _movie_studio_job(jid):
+    job = E.load_job(jid)
+    if not job:
+        return None, (jsonify({"ok": False, "err": "Không tìm thấy dự án"}), 404)
+    if not can_access_job(job):
+        return None, forbidden()
+    if job.get("kind") != "movie_studio":
+        return None, (jsonify({"ok": False, "err": "Job không phải dự án Studio phim"}), 400)
+    return job, None
+
+
+def _public_movie_drafts(job):
+    drafts = []
+    for item in job.get("drafts") or []:
+        public = {key: value for key, value in item.items() if key != "source_path"}
+        public["preview_url"] = f"/api/movie-studio/{job['id']}/source/{int(item.get('index', 0))}"
+        drafts.append(public)
+    return drafts
+
+
+@app.get("/api/movie-studio/<jid>")
+def api_movie_studio_get(jid):
+    job, error = _movie_studio_job(jid)
+    if error: return error
+    opts = job.get("opts") or {}
+    return jsonify({"ok": True, "id": jid, "status": job.get("status"),
+                    "phase": job.get("phase"), "draft_version": job.get("draft_version", 0),
+                    "drafts": _public_movie_drafts(job), "error": job.get("error", ""),
+                    "original_subtitles": opts.get("original_subtitles", "smart_bottom"),
+                    "subtitle_region": opts.get("subtitle_region")})
+
+
+@app.patch("/api/movie-studio/<jid>")
+def api_movie_studio_update(jid):
+    with JOB_STATE_LOCK:
+        job, error = _movie_studio_job(jid)
+        if error: return error
+        if job.get("status") != "awaiting_review":
+            return jsonify({"ok": False, "err": "Dự án không ở trạng thái chờ duyệt"}), 409
+        data = request.get_json(silent=True) or {}
+        original_subtitles = str(data.get("original_subtitles") or
+                                 (job.get("opts") or {}).get("original_subtitles") or
+                                 "smart_bottom").strip().lower()
+        valid_subtitle_modes = {"keep", "bottom", "top", "smart_bottom", "smart_top", "smart_custom"}
+        if original_subtitles not in valid_subtitle_modes:
+            return jsonify({"ok": False, "err": "Kiểu xử lý phụ đề gốc không hợp lệ"}), 400
+        subtitle_region = data.get("subtitle_region")
+        if original_subtitles == "smart_custom":
+            try:
+                subtitle_region = [round(float(value), 2) for value in subtitle_region]
+                if len(subtitle_region) != 4:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "err": "Hãy khoanh vùng phụ đề trên video"}), 400
+            x, y, width, height = subtitle_region
+            if min(x, y) < 0 or min(width, height) <= 0 or x + width > 100 or y + height > 100:
+                return jsonify({"ok": False, "err": "Vùng phụ đề phải nằm trong khung hình 0–100%"}), 400
+        else:
+            subtitle_region = None
+        submitted = data.get("drafts")
+        if not isinstance(submitted, list):
+            return jsonify({"ok": False, "err": "Dữ liệu bản nháp không hợp lệ"}), 400
+        current = {int(item.get("index", i)): item for i, item in enumerate(job.get("drafts") or [])}
+        updated = []
+        for position, payload in enumerate(submitted):
+            if not isinstance(payload, dict):
+                return jsonify({"ok": False, "err": "Nguồn phim không hợp lệ"}), 400
+            index = int(payload.get("index", position))
+            original = current.get(index)
+            if not original:
+                return jsonify({"ok": False, "err": "Không tìm thấy nguồn phim trong dự án"}), 400
+            duration = float(original.get("duration") or 0)
+            segments = payload.get("segments")
+            if not isinstance(segments, list) or len(segments) > 10000:
+                return jsonify({"ok": False, "err": "Danh sách phụ đề không hợp lệ"}), 400
+            clean, previous_end = [], 0.0
+            for segment_index, segment in enumerate(segments):
+                try:
+                    start, end = round(float(segment.get("start")), 3), round(float(segment.get("end")), 3)
+                except (AttributeError, TypeError, ValueError):
+                    return jsonify({"ok": False, "err": f"Timestamp đoạn {segment_index + 1} không hợp lệ"}), 400
+                text = str(segment.get("text") or "").strip()
+                translated = str(segment.get("translated") or "").strip()
+                speaker = " ".join(str(segment.get("speaker") or "Nhân vật 1").split())[:80]
+                voice = str(segment.get("voice") or "").strip()
+                if start < 0 or end <= start or (duration > 0 and end > duration + 0.05):
+                    return jsonify({"ok": False, "err": f"Thời gian đoạn {segment_index + 1} nằm ngoài video"}), 400
+                if start < previous_end - 0.001:
+                    return jsonify({"ok": False, "err": f"Đoạn {segment_index + 1} chồng thời gian với đoạn trước"}), 400
+                if len(text) > 5000 or len(translated) > 5000:
+                    return jsonify({"ok": False, "err": f"Nội dung đoạn {segment_index + 1} quá dài"}), 400
+                valid_voices = {"", "auto", "nam", "nu", *E.VOICE_BY_LABEL.keys(), *E.GENMAX_VOICES.keys()}
+                if voice not in valid_voices:
+                    return jsonify({"ok": False, "err": f"Giọng đọc đoạn {segment_index + 1} không hợp lệ"}), 400
+                if (voice in E.GENMAX_VOICES and
+                        not (os.environ.get("GENMAX_API_KEY") or E.CONFIG.get("genmax_api_key"))):
+                    return jsonify({"ok": False, "err": "Chưa cấu hình GenMax API key để dùng giọng GenMax"}), 400
+                clean.append({"id": segment_index, "start": start, "end": end,
+                              "text": text, "translated": translated,
+                              "speaker": speaker, "voice": voice})
+                previous_end = end
+            copy = dict(original); copy["segments"] = clean
+            updated.append(copy)
+        if set(current) != {int(item["index"]) for item in updated}:
+            return jsonify({"ok": False, "err": "Phải lưu đủ tất cả nguồn phim trong dự án"}), 400
+        job["drafts"] = sorted(updated, key=lambda item: int(item["index"]))
+        job.setdefault("opts", {})["original_subtitles"] = original_subtitles
+        job["opts"]["subtitle_region"] = subtitle_region
+        job["draft_version"] = int(job.get("draft_version") or 0) + 1
+        job["draft_saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        E.save_job(job)
+    return jsonify({"ok": True, "draft_version": job["draft_version"]})
+
+
+@app.post("/api/movie-studio/<jid>/confirm")
+def api_movie_studio_confirm(jid):
+    with JOB_STATE_LOCK:
+        job, error = _movie_studio_job(jid)
+        if error: return error
+        if job.get("status") != "awaiting_review":
+            return jsonify({"ok": False, "err": "Dự án đã được xác nhận hoặc chưa sẵn sàng"}), 409
+        job["phase"] = "render"
+        job["opts"]["phase"] = "render"
+        job["status"] = "queued"
+        job["confirmed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        E.save_job(job)
+        JOBQ.put(jid)
+    return jsonify({"ok": True, "id": jid})
+
+
+@app.get("/api/movie-studio/<jid>/source/<int:source_index>")
+def api_movie_studio_source(jid, source_index):
+    job, error = _movie_studio_job(jid)
+    if error: return error
+    draft = next((item for item in job.get("drafts") or []
+                  if int(item.get("index", -1)) == source_index), None)
+    if not draft:
+        return jsonify({"ok": False, "err": "Không tìm thấy nguồn phim"}), 404
+    source = os.path.realpath(str(draft.get("source_path") or ""))
+    work_root = os.path.realpath(os.path.join(E.WORK_DIR, jid))
+    try:
+        inside = os.path.commonpath([source, work_root]) == work_root
+    except ValueError:
+        inside = False
+    if not inside or not os.path.isfile(source):
+        return jsonify({"ok": False, "err": "Nguồn xem trước không hợp lệ"}), 404
+    return send_from_directory(os.path.dirname(source), os.path.basename(source), conditional=True)
+
+@app.post("/api/soundtrack")
+def api_soundtrack():
+    video_url = str(request.form.get("video_url") or "").strip()
+    audio_url = str(request.form.get("audio_url") or "").strip()
+    video_speed = str(request.form.get("video_speed") or "1").strip()
+    movie_flip = str(request.form.get("movie_flip") or "none").strip().lower()
+    if not re.match(r"^https?://", video_url, re.I):
+        return jsonify({"ok": False, "err": "Link video không hợp lệ"}), 400
+    if not re.match(r"^https?://", audio_url, re.I):
+        return jsonify({"ok": False, "err": "Link âm thanh không hợp lệ"}), 400
+    if video_speed not in ("0.75", "1", "1.25", "1.5", "2"):
+        return jsonify({"ok": False, "err": "Tốc độ video không hợp lệ"}), 400
+    if movie_flip not in ("none", "hflip"):
+        return jsonify({"ok": False, "err": "Kiểu lật hình không hợp lệ"}), 400
+    inputs = [{"type": "link", "url": video_url}]
+    opts = {"video_url": video_url, "audio_url": audio_url, "video_speed": float(video_speed),
+            "movie_flip": movie_flip, "n_variants": 1}
+    return jsonify({"ok": True, "id": _make_job("soundtrack", inputs, opts)})
+
+@app.post("/api/reup")
+def api_reup():
+    inputs, _ = _collect()
+    if not inputs:
+        return jsonify({"ok": False, "err": "Chưa có link/file video cần Reup"}), 400
+    source_language = str(request.form.get("source_language") or "").strip().lower()
+    if source_language not in ("", *translate.LANGUAGES.keys()):
+        return jsonify({"ok": False, "err": "Ngôn ngữ nguồn không hợp lệ"}), 400
+    summary_minutes = str(request.form.get("summary_minutes") or "auto").strip().lower()
+    if summary_minutes not in ("auto", "1", "3", "5", "10"):
+        return jsonify({"ok": False, "err": "Thời lượng Reup không hợp lệ"}), 400
+    original_subtitles = str(request.form.get("original_subtitles") or "smart_bottom").strip().lower()
+    if original_subtitles not in ("keep", "bottom", "top", "smart_bottom", "smart_top"):
+        return jsonify({"ok": False, "err": "Xử lý phụ đề gốc không hợp lệ"}), 400
+    provider = str(request.form.get("tts_provider") or E.CONFIG.get("tts_provider") or "vivibe").lower()
+    if provider not in ("genmax", "vivibe"):
+        return jsonify({"ok": False, "err": "Dịch vụ giọng đọc không hợp lệ"}), 400
+    if provider == "genmax" and not (os.environ.get("GENMAX_API_KEY") or E.CONFIG.get("genmax_api_key")):
+        return jsonify({"ok": False, "err": "Chưa cấu hình GenMax API key"}), 400
+    if provider == "vivibe" and not (os.environ.get("VIVIBE_API_KEY") or E.CONFIG.get("vivibe_api_key")):
+        return jsonify({"ok": False, "err": "Chưa cấu hình Vivibe API key"}), 400
+    opts = {"source_language": source_language, "target_language": "vi",
+            "task_mode": "summary", "output_mode": "summary", "make_summary": True,
+            "summary_minutes": summary_minutes, "tts_provider": provider,
+            "voice": str(request.form.get("voice") or "auto").strip(),
+            "original_subtitles": original_subtitles, "reup_hook_skill": True}
+    return jsonify({"ok": True, "id": _make_job("reup", inputs, opts)})
+
+@app.post("/api/discovery/login")
+def api_discovery_login():
+    data = request.get_json(silent=True) or {}
+    try:
+        result = discovery.launch_login(E.ROOT, session["username"], data.get("platform"))
+        return jsonify({"ok": True, **result})
+    except (ValueError, RuntimeError, OSError) as exc:
+        return jsonify({"ok": False, "err": str(exc)}), 400
+
+@app.post("/api/discovery/search")
+def api_discovery_search():
+    data = request.get_json(silent=True) or {}
+    try:
+        result = discovery.discover(
+            E.ROOT, session["username"], data.get("platform"),
+            topic=data.get("topic", ""), limit=data.get("limit", 30),
+            scan_date=data.get("date"))
+        return jsonify({"ok": True, **result})
+    except ValueError as exc:
+        return jsonify({"ok": False, "err": str(exc)}), 400
+    except (RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return jsonify({"ok": False, "err": str(exc)}), 502
+
+@app.get("/api/discovery/accounts")
+def api_discovery_accounts():
+    return jsonify({"ok": True, "accounts": discovery.list_accounts(E.ROOT, session["username"])})
+
+@app.delete("/api/discovery/account/<platform>")
+def api_discovery_account_delete(platform):
+    try:
+        result = discovery.reset_account(E.ROOT, session["username"], platform)
+        return jsonify({"ok": True, **result})
+    except (ValueError, RuntimeError, OSError) as exc:
+        return jsonify({"ok": False, "err": str(exc)}), 400
 
 def _slim(j):
     o = j.get("opts", {}); nin = len(j.get("inputs", []))
     nv = int(o.get("n_variants", 1) or 1)
     if j["kind"] == "review":
         exp = nv * max(1, int(o.get("hook_variants", 1) or 1))
-    elif j["kind"] == "translate":
-        counts = {"srt": 1, "burn": 1, "both": 2, "summary": 2}
+    elif j["kind"] in ("translate", "reup", "movie_studio"):
+        counts = {"srt": 1, "burn": 1, "dub": 1, "both": 2, "dub_srt": 2,
+                  "summary": 2, "all": 3}
         exp = max(1, nin) * counts.get(o.get("output_mode"), 2)
     else:
         exp = nv * max(1, nin)
@@ -459,7 +826,7 @@ def _slim(j):
             "owner":j.get("owner", "legacy"),
             "n_out":len(j.get("outputs",[])),"n_in":nin,"expected":exp,
             "product":j.get("product",""),"error":j.get("error",""),
-            "log_len":len(j.get("log",[]))}
+            "log_len":len(j.get("log",[])),"phase":j.get("phase","")}
 
 @app.get("/api/jobs")
 def api_jobs():
@@ -622,6 +989,7 @@ def api_get_settings():
     s["vivibe_key_set"] = bool(os.environ.get("VIVIBE_API_KEY") or E.CONFIG.get("vivibe_api_key"))
     s["genmax_key_set"] = bool(os.environ.get("GENMAX_API_KEY") or E.CONFIG.get("genmax_api_key"))
     s["douyin_cookie_set"] = bool(os.environ.get("DOUYIN_COOKIE") or E.CONFIG.get("douyin_cookie"))
+    s["bilibili_cookie_set"] = bool(os.environ.get("BILIBILI_COOKIE") or E.CONFIG.get("bilibili_cookie"))
     s["facebook_pages"] = [{"id": p["id"], "name": p.get("name") or p["id"]}
                            for p in facebook_pages()]
     s["facebook_key_set"] = bool(s["facebook_pages"])
@@ -634,6 +1002,7 @@ def api_set_settings():
     saved_key = save_vivibe_key(data.pop("vivibe_api_key", ""))
     saved_genmax_key = save_genmax_key(data.pop("genmax_api_key", ""))
     saved_douyin_cookie = save_douyin_cookie(data.pop("douyin_cookie", ""))
+    saved_bilibili_cookie = save_bilibili_cookie(data.pop("bilibili_cookie", ""))
     if saved_key or saved_genmax_key:
         with _CREDITS_LOCK:
             _CREDITS_CACHE.update({"at": 0.0, "data": None})
@@ -645,6 +1014,7 @@ def api_set_settings():
     result["vivibe_key_set"] = saved_key or bool(os.environ.get("VIVIBE_API_KEY"))
     result["genmax_key_set"] = saved_genmax_key or bool(os.environ.get("GENMAX_API_KEY"))
     result["douyin_cookie_set"] = saved_douyin_cookie or bool(os.environ.get("DOUYIN_COOKIE") or E.CONFIG.get("douyin_cookie"))
+    result["bilibili_cookie_set"] = saved_bilibili_cookie or bool(os.environ.get("BILIBILI_COOKIE") or E.CONFIG.get("bilibili_cookie"))
     result["facebook_key_set"] = fb_configured
     return jsonify(result)
 
@@ -976,7 +1346,7 @@ textarea:focus,input:focus,select:focus{border-color:var(--acc);background:#0e14
 textarea{min-height:78px;resize:vertical}
 select{appearance:none;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' stroke='%238a95a7' stroke-width='2'><path d='M2 4l4 4 4-4'/></svg>");
  background-repeat:no-repeat;background-position:right 11px center;padding-right:30px}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:11px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:11px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px}.row4{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}
 .drop{border:1.5px dashed var(--line2);border-radius:10px;padding:14px;text-align:center;color:var(--mut);
  font-size:12.5px;cursor:pointer;transition:.12s;background:#0d121b}
 .drop:hover{border-color:var(--acc);color:var(--fg)}
@@ -1051,13 +1421,17 @@ textarea,input[type=text],input[type=password],select{background:#fff;border-col
 .fb-publish{display:flex;align-items:center;gap:7px;margin-top:8px}.fb-publish-btn{border:1px solid #1877f2;background:#1877f2;color:#fff;border-radius:5px;padding:6px 9px;font-size:11px;font-weight:650;cursor:pointer}.fb-publish-btn:hover{background:#1265d6}.fb-publish-btn:disabled{opacity:.55;cursor:default}.fb-published{color:var(--ok);font-size:11px;font-weight:650}.fb-published a{color:var(--ok)}
 .fb-page-select{min-width:0;flex:1;padding:6px 26px 6px 8px;font-size:11px}.fb-post-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}.fb-post-chip{background:#e8f3ed;color:var(--ok);border-radius:4px;padding:3px 6px;font-size:10px;font-weight:650}.fb-page-row{display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--line);font-size:12px}.fb-page-row span{min-width:0;flex:1}.fb-page-row small{display:block;color:var(--mut2)}
 .page-posts-toolbar{display:flex;align-items:end;gap:9px;margin-bottom:14px}.page-posts-toolbar>div{min-width:220px}.page-posts-toolbar label{margin-top:0}.page-post-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.page-post{display:grid;grid-template-columns:112px minmax(0,1fr);background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden}.page-post-media{width:112px;height:112px;object-fit:cover;background:#edf2f4}.page-post-media.empty{border:0;border-radius:0;padding:0;display:grid;place-items:center}.page-post-body{padding:11px;min-width:0}.page-post-message{font-size:12px;line-height:1.45;white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.page-post-meta{color:var(--mut2);font-size:10px;margin-top:6px}.page-post-actions{display:flex;gap:7px;margin-top:8px}
+.studio-segments{margin-top:12px;overflow-x:auto}.studio-segment{display:grid;grid-template-columns:120px 170px 72px 72px minmax(180px,1fr) minmax(180px,1fr);gap:8px;align-items:start;min-width:1050px;padding:9px;border:1px solid var(--line);border-radius:7px;margin-top:7px;background:#fff}.studio-segment:hover{border-color:#9fc9c5}.studio-segment input,.studio-segment select{padding:7px}.studio-segment textarea{min-height:58px;padding:7px}.studio-segment-head{display:grid;grid-template-columns:120px 170px 72px 72px minmax(180px,1fr) minmax(180px,1fr);gap:8px;min-width:1050px;color:var(--mut);font-size:11px;font-weight:650;padding:0 9px}
+.studio-video-wrap{position:relative;width:100%;background:#111;border-radius:8px;overflow:hidden}.studio-video-wrap video{display:block;width:100%;max-height:430px;background:#111}.studio-region-layer{position:absolute;inset:0;pointer-events:none}.studio-region-layer.picking{pointer-events:auto;cursor:crosshair;background:rgba(0,0,0,.08)}.studio-region-box{position:absolute;border:2px solid #ff334f;background:rgba(255,51,79,.16);box-shadow:0 0 0 9999px rgba(0,0,0,.12);pointer-events:none}.studio-region-box:after{content:"Vùng sub cũ";position:absolute;left:4px;top:4px;padding:2px 5px;border-radius:3px;background:#ff334f;color:#fff;font-size:10px;font-weight:700}.studio-region-actions{display:flex;align-items:end;gap:8px;margin-top:10px}.studio-region-actions>div{min-width:210px;flex:1}.studio-region-values{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:8px}.studio-region-values input{padding:7px}
+.studio-template-layout{display:grid;grid-template-columns:180px minmax(220px,1fr);gap:14px;align-items:start;margin-top:10px}.studio-template-frame{position:relative;width:520px;max-width:100%;aspect-ratio:16/9;margin:auto;background:linear-gradient(145deg,#27333b,#10161a);border:1px solid #71818b;border-radius:8px;overflow:hidden;touch-action:none;cursor:crosshair}.studio-template-frame:before{content:"KHUNG HÌNH MẪU";position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.28);font-size:13px;font-weight:750;letter-spacing:.16em}.studio-template-box{position:absolute;border:2px solid #ff334f;background:rgba(255,51,79,.2);box-shadow:0 0 0 9999px rgba(0,0,0,.15);pointer-events:none}.studio-template-box:after{content:"SUB CŨ";position:absolute;left:4px;top:4px;background:#ff334f;color:#fff;border-radius:3px;padding:2px 5px;font-size:9px;font-weight:750}
 .post-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:8px}.post-metric{background:#f3f7f8;border-radius:4px;padding:5px 6px;min-width:0}.post-metric b{display:block;font-size:12px}.post-metric span{display:block;color:var(--mut2);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.post-engagement{color:var(--acc);font-size:10px;font-weight:650;margin-top:6px}
 .content-table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fff;max-height:68vh}.content-table{width:100%;min-width:1540px;border-collapse:separate;border-spacing:0;font-size:11px}.content-table th{position:sticky;top:0;z-index:2;background:#f3f6f8;color:#3d5360;font-weight:700;text-align:left;padding:10px 9px;border-bottom:1px solid var(--line);white-space:normal;line-height:1.2}.content-table td{padding:9px;border-bottom:1px solid #e8edef;vertical-align:middle;color:var(--fg)}.content-table tbody tr:hover td{background:#f8fbfb}.content-table th:first-child,.content-table td:first-child{position:sticky;left:0;z-index:1;background:#fff;min-width:300px}.content-table th:first-child{z-index:3;background:#f3f6f8}.content-preview{display:grid;grid-template-columns:60px minmax(0,1fr);gap:9px;align-items:center}.content-thumb{width:60px;height:60px;border-radius:6px;object-fit:cover;background:#edf2f4}.content-title{max-width:220px;font-size:11px;font-weight:650;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.content-date{color:var(--mut2);font-size:9px;margin-top:3px}.status-ok{display:inline-flex;align-items:center;gap:5px;border:1px solid #b9d9cb;border-radius:5px;padding:4px 7px;white-space:nowrap}.status-ok:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}.metric-cell{font-variant-numeric:tabular-nums;white-space:nowrap}.table-actions{display:flex;gap:5px;white-space:nowrap}
 .movie-modes{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.movie-mode{display:flex;align-items:flex-start;gap:10px;margin:0;padding:13px;border:1px solid var(--line2);border-radius:7px;background:#fff;cursor:pointer}.movie-mode:has(input:checked){border-color:var(--acc);background:var(--soft);box-shadow:0 0 0 2px var(--focus)}.movie-mode input{width:auto;margin:3px 0 0;accent-color:var(--acc)}.movie-mode b{display:block}.movie-mode span{display:block;color:var(--mut);font-size:11px;font-weight:400;margin-top:2px}
 .video-note{margin-top:8px;padding:9px;background:#f7f9fa;border:1px solid var(--line);border-radius:5px}.video-note-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#335e72;font-size:10px;font-weight:700;text-transform:uppercase}.video-note-actions{display:flex;align-items:center;gap:9px}.video-note-input{min-height:42px;max-height:100px;margin-top:5px;padding:7px 8px;font-size:11px;line-height:1.4}.save-video-note,.copy-video-note{border:0;background:transparent;color:var(--acc2);font-size:10px;font-weight:650;cursor:pointer;padding:2px 0}.save-video-note:hover,.copy-video-note:hover{text-decoration:underline}.save-video-note:disabled{opacity:.5;cursor:default}.posted-check{display:flex;align-items:center;gap:6px;margin:7px 0 0;color:#335e72;font-size:11px;font-weight:650;cursor:pointer}.posted-check input{width:15px;height:15px;margin:0;accent-color:var(--acc);cursor:pointer}.posted-check.saving{opacity:.55}
+.discover-actions{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.discover-actions .btn{margin:0}.discover-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(245px,1fr));gap:12px;margin-top:15px}.discover-card{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fff}.discover-card img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#edf2f4}.discover-card .dc-body{padding:11px}.discover-card h3{font-size:13px;line-height:1.35;margin:0 0 6px;height:36px;overflow:hidden}.discover-meta{font-size:10px;color:var(--mut);display:flex;gap:7px;flex-wrap:wrap}.discover-score{color:var(--acc);font-weight:750}.discover-card .dc-foot{display:flex;align-items:center;gap:7px;margin-top:10px}.discover-card .dc-foot input{width:16px;height:16px}.discover-empty{padding:24px;text-align:center;color:var(--mut);border:1px dashed var(--line2);border-radius:8px;margin-top:14px}
 .outs{grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:10px}.out{display:grid;grid-template-columns:160px minmax(0,1fr);align-items:start}.out video{width:160px;aspect-ratio:9/16}.out .m{padding:11px 12px;min-width:0}.out-title{display:flex;justify-content:space-between;gap:8px;align-items:flex-start;margin-bottom:7px;color:var(--fg);font-size:12px;font-weight:650}.out-duration{color:var(--mut2);font-weight:500;white-space:nowrap}.out-tags{margin-bottom:6px}.dl{margin-top:2px;font-weight:650}
-@media(max-width:900px){.cols4{grid-template-columns:repeat(2,1fr)}.row3{grid-template-columns:1fr 1fr}.stepper{display:grid;grid-template-columns:1fr}.content{padding:20px 20px 96px}.top{padding:15px 20px}}
-@media(max-width:680px){body{font-size:13px}.app{display:block;height:auto;min-height:100vh}.side{position:fixed;left:0;right:0;bottom:0;height:68px;border:0;border-top:1px solid var(--line);padding:5px 6px;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}.brand,.side .foot{display:none}nav{height:100%;margin:0;display:flex;flex-direction:row;justify-content:flex-start;gap:2px;overflow-x:auto}.nav{position:relative;min-width:64px;flex:0 0 64px;flex-direction:column;justify-content:center;gap:2px;padding:4px 2px;border:0;font-size:10px;line-height:1.1;text-align:center}.nav svg{width:20px;height:20px}.nav.on{border:0}.nav .badge{position:absolute;top:2px;right:15%;margin:0;padding:0 5px}.main{overflow:visible}.top{padding:13px 16px;align-items:center}.top h1{font-size:17px}.top .hint{display:none}.content{padding:16px 12px 94px}.cols2,.cols3,.cols4,.row2,.row3{grid-template-columns:1fr}.grid{gap:12px}.card{padding:16px}.stepper{gap:6px;margin-bottom:14px}.stp{padding:8px 10px}.stp .ds{display:none}.job .h{align-items:flex-start;flex-wrap:wrap}.job .h .meta{width:100%;margin-left:0!important}.outs{grid-template-columns:1fr}.out{grid-template-columns:120px minmax(0,1fr)}.out video{width:120px}.out .m{padding:9px}.hero-h{font-size:18px}.seg{width:100%}.seg button{flex:1;padding:7px 6px}.results-toolbar .post-filter{margin-left:0}.results-toolbar .meta{order:3;width:100%}.toast{left:12px;right:12px;bottom:82px;text-align:center}}
+@media(max-width:900px){.cols4{grid-template-columns:repeat(2,1fr)}.row3{grid-template-columns:1fr 1fr}.studio-template-layout{grid-template-columns:1fr}.stepper{display:grid;grid-template-columns:1fr}.content{padding:20px 20px 96px}.top{padding:15px 20px}}
+@media(max-width:680px){body{font-size:13px}.app{display:block;height:auto;min-height:100vh}.side{position:fixed;left:0;right:0;bottom:0;height:68px;border:0;border-top:1px solid var(--line);padding:5px 6px;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}.brand,.side .foot{display:none}nav{height:100%;margin:0;display:flex;flex-direction:row;justify-content:flex-start;gap:2px;overflow-x:auto}.nav{position:relative;min-width:64px;flex:0 0 64px;flex-direction:column;justify-content:center;gap:2px;padding:4px 2px;border:0;font-size:10px;line-height:1.1;text-align:center}.nav svg{width:20px;height:20px}.nav.on{border:0}.nav .badge{position:absolute;top:2px;right:15%;margin:0;padding:0 5px}.main{overflow:visible}.top{padding:13px 16px;align-items:center}.top h1{font-size:17px}.top .hint{display:none}.content{padding:16px 12px 94px}.cols2,.cols3,.cols4,.row2,.row3,.row4{grid-template-columns:1fr}.grid{gap:12px}.card{padding:16px}.stepper{gap:6px;margin-bottom:14px}.stp{padding:8px 10px}.stp .ds{display:none}.job .h{align-items:flex-start;flex-wrap:wrap}.job .h .meta{width:100%;margin-left:0!important}.outs{grid-template-columns:1fr}.out{grid-template-columns:120px minmax(0,1fr)}.out video{width:120px}.out .m{padding:9px}.hero-h{font-size:18px}.seg{width:100%}.seg button{flex:1;padding:7px 6px}.results-toolbar .post-filter{margin-left:0}.results-toolbar .meta{order:3;width:100%}.toast{left:12px;right:12px;bottom:82px;text-align:center}}
 @media(max-width:680px){.page-posts-toolbar{align-items:stretch;flex-direction:column}.page-posts-toolbar>div{min-width:0;width:100%}.page-post-grid{grid-template-columns:1fr}.page-post{grid-template-columns:96px minmax(0,1fr)}.page-post-media{width:96px;height:110px}.post-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.content-table-wrap{max-height:none}.content-table th:first-child,.content-table td:first-child{min-width:250px}.content-title{max-width:160px}}
 @media(max-width:680px){.fb-overview-head{align-items:stretch;flex-direction:column}.fb-overview-controls{width:100%;flex-wrap:wrap}.fb-overview-controls select{flex:1;min-width:120px}.fb-overview-controls #overviewPage{flex-basis:100%}.fb-overview-controls .btn{margin-left:auto}.fb-overview-grid{grid-template-columns:1fr}.fb-chart{padding:12px 8px 8px}.fb-chart-canvas{height:220px}}
 @media(max-width:460px){.credit-grid{grid-template-columns:1fr}.credit-card{padding:11px 13px}.credit-value{font-size:20px}}
@@ -1093,6 +1467,56 @@ textarea,input[type=text],input[type=password],select{background:#fff;border-col
     <div class="card" style="margin-top:16px"><h2>Job gần đây</h2><p class="d">6 việc mới nhất.</p><div id="recent"></div></div>
    </section>
 
+   <!-- KHÁM PHÁ VIDEO -->
+   <section class="view" id="v-discovery">
+    <div class="card">
+     <h2 class="hero-h">🔥 Khám phá video thịnh hành</h2>
+     <p class="hero-d">Đọc bảng thịnh hành hiện tại bằng phiên đăng nhập lưu riêng trên máy này. Tool chỉ lấy metadata và link; không tự tải video hàng loạt.</p>
+     <div class="row3">
+      <div><label>Nền tảng</label><select id="discoverPlatform"><option value="douyin">Douyin</option><option value="bilibili">Bilibili</option><option value="tiktok">TikTok</option></select></div>
+      <div><label>Chủ đề trong tiêu đề/tác giả</label><input id="discoverTopic" type="text" placeholder="Để trống để xem tất cả"></div>
+      <div><label>Ngày</label><input id="discoverDate" type="date"></div>
+     </div>
+     <div class="discover-actions" style="margin-top:12px">
+      <button class="btn ghost" id="discoverLogin" type="button">Đăng nhập nền tảng</button>
+      <button class="btn" id="discoverSearch" type="button">Quét video thịnh hành</button>
+      <select id="discoverLimit" style="width:auto"><option value="20">20 video</option><option value="30" selected>30 video</option><option value="50">50 video</option></select>
+      <button class="btn ghost" id="discoverReview" type="button">Đưa video đã chọn sang Review</button>
+      <button class="btn ghost" id="discoverRemake" type="button">Đưa video đã chọn sang Remake</button>
+     </div>
+     <p class="d" id="discoverStatus" style="margin:12px 0 0">Chọn nền tảng rồi đăng nhập. Sau khi đăng nhập xong, hãy đóng cửa sổ trình duyệt đó trước khi quét.</p>
+     <div style="margin-top:18px"><h3>Tài khoản đã đăng nhập</h3><p class="d">Các phiên này chỉ được lưu trên máy của bạn.</p><div class="discover-accounts" id="discoverAccounts"></div></div>
+     <div class="discover-grid" id="discoverResults"></div>
+    </div>
+   </section>
+
+   <!-- GHÉP ÂM THANH -->
+   <section class="view" id="v-soundtrack">
+    <div class="card">
+     <h2 class="hero-h">🎵 Ghép âm thanh từ video khác</h2>
+     <p class="hero-d">Giữ hình ảnh của link video thứ nhất và thay toàn bộ âm thanh bằng audio lấy từ link thứ hai.</p>
+     <form id="f5">
+      <div class="sec"><div class="sec-h"><span class="b">1</span> Link video</div>
+       <input type="text" name="video_url" placeholder="Facebook / TikTok / Douyin / Bilibili / YouTube..." required>
+       <p class="d" style="margin-top:6px">Hình ảnh và thời lượng được lấy từ link này.</p>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">2</span> Link âm thanh</div>
+       <input type="text" name="audio_url" placeholder="Dán link video chứa âm thanh muốn sử dụng..." required>
+       <p class="d" style="margin-top:6px">Âm thanh cũ sẽ bị thay. Video mới được cắt theo nguồn có thời lượng ngắn hơn.</p>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">3</span> Tùy chỉnh video</div>
+       <div class="row2">
+        <div><label>Tốc độ video</label><select name="video_speed"><option value="0.75">0.75x · Chậm</option><option value="1" selected>1x · Bình thường</option><option value="1.25">1.25x · Nhanh nhẹ</option><option value="1.5">1.5x · Nhanh</option><option value="2">2x · Rất nhanh</option></select></div>
+        <div><label>Lật hình</label><select name="movie_flip"><option value="none" selected>Giữ hình gốc</option><option value="hflip">Lật gương ngang</option></select></div>
+       </div>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">4</span> Tạo video</div>
+       <button class="btn big-btn" type="submit">🎵 Ghép âm thanh vào video</button>
+      </div>
+     </form>
+    </div>
+   </section>
+
    <!-- REMAKE -->
    <section class="view" id="v-remake">
     <div class="card">
@@ -1116,7 +1540,35 @@ https://www.tiktok.com/@.../video/..."></textarea>
        <div><label>Lật hình</label><select name="flip" data-k="flip">%FLIP%</select></div>
        <div><label>Kiểu nói (style)</label><select name="style" data-k="style">%STYLE%</select></div>
       </div>
+      <label style="display:flex;align-items:center;gap:8px;margin:12px 0">
+       <input type="checkbox" name="remove_original_audio" value="1" style="width:auto">
+       Loại bỏ toàn bộ âm thanh gốc (video đầu ra chỉ giữ giọng đọc mới)
+      </label>
       <button class="btn" type="submit">▶ Làm video</button>
+     </form>
+    </div>
+   </section>
+
+   <!-- REUP VIDEO -->
+   <section class="view" id="v-reup">
+    <div class="card">
+     <h2 class="hero-h">🚀 Reup video · Tóm tắt + Hook 3 giây</h2>
+     <p class="hero-d">Dán link hoặc tải video lên. Tool tự nghe và tóm tắt đúng nội dung, chọn các cảnh quan trọng, tạo hook TikTok 3 giây rồi lồng giọng tiếng Việt.</p>
+     <form id="f4">
+      <div class="sec"><div class="sec-h"><span class="b">1</span> Nguồn video</div>
+       <textarea name="links" placeholder="Dán link YouTube / TikTok / Douyin / Bilibili / Google Drive / Facebook, mỗi dòng 1 link..."></textarea>
+       <label class="drop" id="d4" style="margin-top:8px">📁 hoặc kéo thả / bấm chọn file video<input type="file" name="files" multiple accept="video/*"></label>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">2</span> Tóm tắt và giọng đọc</div>
+       <div class="row2">
+        <div><label>Ngôn ngữ gốc</label><select name="source_language"><option value="">Tự nhận diện</option><option value="zh">Tiếng Trung</option><option value="en">Tiếng Anh</option><option value="ja">Tiếng Nhật</option><option value="ko">Tiếng Hàn</option><option value="th">Tiếng Thái</option><option value="id">Tiếng Indonesia</option><option value="vi">Tiếng Việt</option></select></div>
+        <div><label>Độ dài video Reup</label><select name="summary_minutes"><option value="auto" selected>Tự động theo độ dài nguồn</option><option value="1">Khoảng 1 phút</option><option value="3">Khoảng 3 phút</option><option value="5">Khoảng 5 phút</option><option value="10">Khoảng 10 phút</option></select></div>
+       </div>
+       <div class="row2" style="margin-top:10px"><div><label>Dịch vụ giọng đọc</label><select name="tts_provider" data-provider><option value="vivibe">Vivibe</option><option value="genmax">GenMax</option></select></div><div><label>Giọng tiếng Việt</label><select name="voice">%VOICE%</select></div></div>
+       <div style="margin-top:10px"><label>Xử lý phụ đề/chữ gốc</label><select name="original_subtitles"><option value="smart_bottom" selected>Xóa thông minh local — phía dưới</option><option value="smart_top">Xóa thông minh local — phía trên</option><option value="bottom">Làm mờ phía dưới</option><option value="top">Làm mờ phía trên</option><option value="keep">Giữ chữ gốc</option></select></div>
+       <div class="fbox" style="margin-top:12px"><div class="fbox-t">⚡ Skill tự động</div><p class="d">Tạo 5 hook, chấm Visual · Curiosity · Gap · Clarity · Payoff, chọn hook tốt nhất và ghép cảnh mở đầu khớp nội dung.</p></div>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">3</span> Tạo video Reup</div><button class="btn big-btn" type="submit">✨ Tóm tắt và tạo video Reup</button></div>
      </form>
     </div>
    </section>
@@ -1133,25 +1585,79 @@ https://www.tiktok.com/@.../video/..."></textarea>
       </div>
       <div class="sec">
        <div class="sec-h"><span class="b">1</span> Nguồn phim/video</div>
-       <textarea name="links" placeholder="Dán link YouTube / TikTok / Douyin / Google Drive / Facebook, mỗi dòng 1 link..."></textarea>
+       <div style="margin-bottom:10px"><label>Tên phim <span class="meta">(không bắt buộc)</span></label><input name="movie_title" maxlength="160" placeholder="Ví dụ: Tây Du Ký · Tập 01"><p class="d" style="margin-top:6px">Nếu nhập, tên phim sẽ hiện thành header căn giữa phía trên video mới. Bỏ trống để không thêm header.</p></div>
+       <textarea name="links" placeholder="Dán link YouTube / Bilibili / TikTok / Douyin / Google Drive / Facebook, mỗi dòng 1 link..."></textarea>
        <label class="drop" id="d3" style="margin-top:8px">📁 hoặc kéo thả / bấm chọn file video<input type="file" name="files" multiple accept="video/*"></label>
       </div>
       <div class="sec">
        <div class="sec-h"><span class="b">2</span> Ngôn ngữ và đầu ra</div>
        <div class="row2">
         <div><label>Ngôn ngữ gốc</label><select name="source_language"><option value="">Tự nhận diện</option><option value="zh">Tiếng Trung</option><option value="en">Tiếng Anh</option><option value="ja">Tiếng Nhật</option><option value="ko">Tiếng Hàn</option><option value="th">Tiếng Thái</option><option value="id">Tiếng Indonesia</option><option value="vi">Tiếng Việt</option></select></div>
-        <div><label>Dịch sang</label><select name="target_language" id="movieTargetLanguage"><option value="vi" selected>Tiếng Việt</option><option value="en">Tiếng Anh</option><option value="zh">Tiếng Trung</option></select></div>
+        <div><label>Dịch sang</label><select name="target_language" id="movieTargetLanguage"><option value="vi" selected>Tiếng Việt</option><option value="en">Tiếng Anh</option><option value="zh">Tiếng Trung</option><option value="none">Không dịch · giữ nguyên lời gốc</option></select></div>
        </div>
-       <div id="translateOptions"><label>Kết quả dịch</label><select name="translation_output"><option value="dub_subtitle" selected>Lồng tiếng Việt + phụ đề Việt</option><option value="dub">Chỉ lồng tiếng Việt</option><option value="both">SRT + toàn bộ phim có phụ đề</option><option value="srt">Chỉ file SRT</option><option value="burn">Chỉ toàn bộ phim có phụ đề</option></select></div>
+       <div class="row2" style="margin-top:10px">
+        <div><label>Tốc độ video</label><select name="video_speed"><option value="0.75">0.75x · Chậm</option><option value="1" selected>1x · Bình thường</option><option value="1.25">1.25x · Nhanh nhẹ</option><option value="1.5">1.5x · Nhanh</option><option value="2">2x · Rất nhanh</option></select></div>
+        <div><label>Lật hình</label><select name="movie_flip"><option value="none" selected>Giữ hình gốc</option><option value="hflip">Lật gương ngang</option></select></div>
+       </div>
+       <div id="translateOptions"><label>Kết quả dịch</label><select name="translation_output" id="movieTranslationOutput"><option value="original" id="movieOriginalOutput">Giữ nguyên video gốc</option><option value="both" selected>SRT + toàn bộ phim có phụ đề</option><option value="dub">Chỉ phim lồng tiếng Việt</option><option value="dub_srt">SRT + phim lồng tiếng Việt</option><option value="all">SRT + phim phụ đề + phim lồng tiếng Việt</option><option value="srt">Chỉ file SRT</option><option value="burn">Chỉ toàn bộ phim có phụ đề</option></select></div>
        <div id="summaryOptions">
         <label>Độ dài video tóm tắt</label><select name="summary_minutes"><option value="auto" selected>Tự động · khoảng 1/6 phim (60 phút → 10 phút)</option><option value="5">Khoảng 5 phút</option><option value="10">Khoảng 10 phút</option><option value="15">Khoảng 15 phút</option><option value="20">Khoảng 20 phút</option></select>
        </div>
-       <div class="row2" style="margin-top:10px"><div><label>Dịch vụ giọng đọc/lồng tiếng</label><select name="tts_provider" data-provider><option value="vivibe">Vivibe</option><option value="genmax">GenMax</option></select></div><div><label>Giọng tiếng Việt</label><select name="voice">%VOICE%</select></div></div>
-       <div style="margin-top:10px"><label>Xử lý phụ đề gốc</label><select name="original_subtitles"><option value="smart_bottom" selected>Xóa thông minh local — phía dưới</option><option value="smart_top">Xóa thông minh local — phía trên</option><option value="bottom">Làm mờ phía dưới (nhanh, chỉ Dịch phim)</option><option value="top">Làm mờ phía trên (nhanh, chỉ Dịch phim)</option><option value="keep">Giữ sub gốc</option></select><p class="d" style="margin-top:6px">Áp dụng cho cả Dịch phim và Tóm tắt phim. Tool nhận diện nét chữ rồi tái tạo nền bằng OpenCV; nếu lỗi sẽ tự làm mờ vùng sub.</p></div>
+       <div id="movieVoiceOptions" class="row2" style="margin-top:10px"><div><label>Dịch vụ giọng đọc</label><select name="tts_provider" data-provider><option value="vivibe">Vivibe</option><option value="genmax">GenMax</option></select></div><div><label>Giọng tiếng Việt</label><select name="voice">%VOICE%</select></div></div>
+       <div style="margin-top:10px"><label>Xử lý phụ đề gốc</label><select name="original_subtitles" id="movieOriginalSubtitles"><option value="smart_bottom" selected>Xóa thông minh local — phía dưới</option><option value="smart_top">Xóa thông minh local — phía trên</option><option value="bottom">Làm mờ phía dưới (nhanh, chỉ Dịch phim)</option><option value="top">Làm mờ phía trên (nhanh, chỉ Dịch phim)</option><option value="keep">Giữ sub gốc</option></select><p class="d" style="margin-top:6px">Áp dụng cho cả Dịch phim và Tóm tắt phim. Tool nhận diện nét chữ rồi tái tạo nền bằng OpenCV; nếu lỗi sẽ tự làm mờ vùng sub.</p></div>
+       <div class="row3" style="margin-top:10px">
+        <div><label>Cỡ chữ sub</label><input type="number" name="subtitle_font_size" min="12" max="48" value="18"></div>
+        <div><label>Màu chữ sub</label><input type="color" name="subtitle_font_color" value="#ffffff" style="height:39px;padding:3px"></div>
+        <div><label>Màu viền sub</label><input type="color" name="subtitle_outline_color" value="#101010" style="height:39px;padding:3px"></div>
+       </div>
+       <p class="d" style="margin-top:6px">Áp dụng cho sub dịch và lời thuyết minh trên video tóm tắt.</p>
       </div>
       <div class="sec"><div class="sec-h"><span class="b">3</span> Bắt đầu dịch</div>
        <button class="btn big-btn" type="submit">✨ Dịch phim — xem ở tab Kết quả</button></div>
      </form>
+    </div>
+   </section>
+
+   <!-- STUDIO PHIM -->
+   <section class="view" id="v-studio">
+    <div class="card">
+     <h2 class="hero-h">🎞️ Studio phim · duyệt trước khi render</h2>
+     <p class="hero-d">Tạo bản nháp lời thoại và bản dịch trước. Bạn có thể sửa nội dung, chỉnh timestamp, xem lại từng đoạn rồi mới xác nhận render video.</p>
+     <form id="f6">
+      <div class="sec"><div class="sec-h"><span class="b">1</span> Nguồn phim</div>
+       <label>Tên phim <span class="meta">(không bắt buộc)</span></label><input name="movie_title" maxlength="160" placeholder="Ví dụ: Người Phụ Nữ Bí Ẩn · Tập 6">
+       <textarea name="links" placeholder="Dán link YouTube / Bilibili / TikTok / Douyin / Google Drive / Facebook, mỗi dòng 1 link..."></textarea>
+       <label class="drop" id="d6" style="margin-top:8px">📁 hoặc kéo thả / bấm chọn file video<input type="file" name="files" multiple accept="video/*"></label>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">2</span> Chế độ và đầu ra</div>
+       <div class="movie-modes">
+        <label class="movie-mode"><input type="radio" name="task_mode" value="translate" checked><div><b>Dịch phim</b><span>Duyệt phụ đề trước khi xuất SRT/video</span></div></label>
+        <label class="movie-mode"><input type="radio" name="task_mode" value="summary"><div><b>Tóm tắt phim</b><span>Duyệt lời dịch trước khi dựng tóm tắt</span></div></label>
+       </div>
+       <div class="row2"><div><label>Ngôn ngữ gốc</label><select name="source_language"><option value="">Tự nhận diện</option><option value="zh">Tiếng Trung</option><option value="en">Tiếng Anh</option><option value="ja">Tiếng Nhật</option><option value="ko">Tiếng Hàn</option><option value="th">Tiếng Thái</option><option value="id">Tiếng Indonesia</option><option value="vi">Tiếng Việt</option></select></div><div><label>Dịch sang</label><select name="target_language"><option value="vi" selected>Tiếng Việt</option><option value="en">Tiếng Anh</option><option value="zh">Tiếng Trung</option><option value="none">Giữ nguyên lời gốc</option></select></div></div>
+       <div class="row2" style="margin-top:10px"><div><label>Kết quả dịch</label><select name="translation_output"><option value="both" selected>SRT + phim có phụ đề</option><option value="srt">Chỉ file SRT</option><option value="burn">Chỉ phim có phụ đề</option><option value="dub">Phim lồng tiếng Việt</option><option value="dub_srt">SRT + phim lồng tiếng</option><option value="all">Tất cả đầu ra</option></select></div><div><label>Độ dài tóm tắt</label><select name="summary_minutes"><option value="auto">Tự động</option><option value="5">Khoảng 5 phút</option><option value="10">Khoảng 10 phút</option><option value="15">Khoảng 15 phút</option><option value="20">Khoảng 20 phút</option></select></div></div>
+       <div class="row2" style="margin-top:10px"><div><label>Dịch vụ giọng đọc</label><select name="tts_provider" data-provider><option value="vivibe">Vivibe</option><option value="genmax">GenMax</option></select></div><div><label>Giọng tiếng Việt</label><select name="voice">%VOICE%</select></div></div>
+       <div class="row2" style="margin-top:10px"><div><label>Tốc độ video</label><select name="video_speed"><option value="1" selected>1x · Bình thường</option><option value="0.75">0.75x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option></select></div><div><label>Lật hình</label><select name="movie_flip"><option value="none" selected>Giữ hình gốc</option><option value="hflip">Lật gương ngang</option></select></div></div>
+       <div style="margin-top:10px"><label>Xử lý phụ đề gốc</label><select name="original_subtitles" id="studioOriginalSubtitles"><option value="smart_bottom" selected>Xóa thông minh local — phía dưới</option><option value="smart_top">Xóa thông minh local — phía trên</option><option value="smart_custom">Xóa thông minh — vùng tùy chỉnh</option><option value="bottom">Làm mờ phía dưới</option><option value="top">Làm mờ phía trên</option><option value="keep">Giữ sub gốc</option></select></div>
+       <div id="studioSubtitleRegion" style="display:none"><div class="studio-template-layout"><div><label>Tỷ lệ khung hình mẫu</label><select name="subtitle_frame_ratio" id="studioFrameRatio"><option value="9:16">9:16 · Video dọc</option><option value="16:9" selected>16:9 · Video ngang</option><option value="1:1">1:1 · Vuông</option><option value="4:3">4:3 · Ngang cổ điển</option><option value="3:4">3:4 · Dọc</option></select><p class="d" style="margin-top:7px">Kéo chuột trực tiếp trên khung mẫu để khoanh vùng sub cũ.</p></div><div id="studioTemplateFrame" class="studio-template-frame"><div id="studioTemplateBox" class="studio-template-box"></div></div></div><div class="row4" style="margin-top:10px"><div><label>X (%)</label><input type="number" name="subtitle_region_x" min="0" max="99" step="0.5" value="5"></div><div><label>Y (%)</label><input type="number" name="subtitle_region_y" min="0" max="99" step="0.5" value="70"></div><div><label>Rộng (%)</label><input type="number" name="subtitle_region_width" min="1" max="100" step="0.5" value="90"></div><div><label>Cao (%)</label><input type="number" name="subtitle_region_height" min="1" max="100" step="0.5" value="25"></div></div></div>
+       <div class="row3" style="margin-top:10px"><div><label>Cỡ chữ sub</label><input type="number" name="subtitle_font_size" min="12" max="48" value="18"></div><div><label>Màu chữ</label><input type="color" name="subtitle_font_color" value="#ffffff" style="height:39px;padding:3px"></div><div><label>Màu viền</label><input type="color" name="subtitle_outline_color" value="#101010" style="height:39px;padding:3px"></div></div>
+      </div>
+      <div class="sec"><div class="sec-h"><span class="b">3</span> Tạo bản nháp</div><button class="btn big-btn" type="submit">✨ Phân tích và tạo bản nháp để duyệt</button></div>
+     </form>
+     <div id="studioProject" style="display:none;margin-top:18px">
+      <div class="sec-h"><span class="b">4</span> Duyệt nội dung và timestamp</div>
+      <div id="studioState" class="fbox"></div>
+      <div id="studioEditor" style="display:none">
+       <div class="row2" style="margin:12px 0"><div><label>Nguồn đang sửa</label><select id="studioSource"></select></div><div><label>Xem trước</label><div class="d">Bấm một dòng bên dưới để phát đúng đoạn.</div></div></div>
+       <div class="studio-region-actions"><div><label>Xử lý sub cũ khi render</label><select id="studioReviewSubtitleMode"><option value="smart_bottom">Xóa thông minh — phía dưới</option><option value="smart_top">Xóa thông minh — phía trên</option><option value="smart_custom">Xóa thông minh — chọn trực tiếp trên video</option><option value="bottom">Làm mờ phía dưới</option><option value="top">Làm mờ phía trên</option><option value="keep">Giữ sub gốc</option></select></div><button class="btn ghost" id="studioPickRegion" type="button">▣ Khoanh vùng trên video</button></div>
+       <div id="studioReviewRegionValues" class="studio-region-values" style="display:none"><div><label>X (%)</label><input id="studioRegionX" type="number" min="0" max="99" step="0.1"></div><div><label>Y (%)</label><input id="studioRegionY" type="number" min="0" max="99" step="0.1"></div><div><label>Rộng (%)</label><input id="studioRegionW" type="number" min="0.1" max="100" step="0.1"></div><div><label>Cao (%)</label><input id="studioRegionH" type="number" min="0.1" max="100" step="0.1"></div></div>
+       <div class="d" id="studioRegionHelp" style="display:none;margin:7px 0">Bấm “Khoanh vùng”, sau đó kéo chuột từ góc trên trái đến góc dưới phải của vùng chứa sub cũ.</div>
+       <div class="studio-video-wrap"><video id="studioVideo" controls preload="metadata"></video><div id="studioRegionLayer" class="studio-region-layer"><div id="studioRegionBox" class="studio-region-box" style="display:none"></div></div></div>
+       <div class="d" style="margin-top:10px">Mỗi line có giọng riêng. Đổi giọng ở line nào chỉ áp dụng cho đúng line đó.</div>
+       <div id="studioSegments" class="studio-segments"></div>
+       <div style="display:flex;gap:8px;margin-top:12px"><button class="btn ghost" id="studioSave" type="button">💾 Lưu bản nháp</button><button class="btn" id="studioConfirm" type="button">✓ Xác nhận và render</button></div>
+      </div>
+     </div>
     </div>
    </section>
 
@@ -1198,10 +1704,11 @@ https://www.tiktok.com/@.../video/..."></textarea>
         </div>
        </div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;margin-top:14px;cursor:pointer;font-size:12px">
-       <input type="checkbox" name="blur" value="1" style="width:auto"> Che chữ Trung (chỉ bật nếu nguồn Douyin — chậm ~4ph/bản)</label>
+      <div style="margin-top:14px"><label>Xử lý phụ đề/chữ gốc</label><select name="original_subtitles"><option value="smart_bottom" selected>Xóa thông minh local — phía dưới</option><option value="smart_top">Xóa thông minh local — phía trên</option><option value="bottom">Làm mờ phía dưới (nhanh)</option><option value="top">Làm mờ phía trên (nhanh)</option><option value="keep">Giữ chữ gốc</option></select><p class="d" style="margin-top:6px">Dùng OpenCV tái tạo nền giống tab Dịch phim; nếu xóa lỗi sẽ tự làm mờ vùng sub.</p></div>
       <label style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer;font-size:12px">
        <input type="checkbox" name="exclude_people" value="1" style="width:auto"> Loại cảnh có người (vẫn giữ cảnh chỉ có bàn tay)</label>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer;font-size:12px">
+       <input type="checkbox" name="remove_original_audio" value="1" style="width:auto"> Loại bỏ toàn bộ âm thanh gốc (video đầu ra chỉ giữ giọng đọc mới)</label>
       <div class="sec"><div class="sec-h"><span class="b">3</span> Tạo video</div>
        <button class="btn big-btn" type="submit">✨ Tạo video — xem kết quả ở tab Kết quả</button></div>
      </form>
@@ -1212,7 +1719,7 @@ https://www.tiktok.com/@.../video/..."></textarea>
    <section class="view" id="v-jobs">
     <div class="results-toolbar">
      <div class="seg" id="filter">
-      <button class="on" data-f="all">Tất cả</button><button data-f="remake">Remake</button><button data-f="review">Review</button><button data-f="translate">Dịch phim</button>
+      <button class="on" data-f="all">Tất cả</button><button data-f="reup">Reup</button><button data-f="remake">Remake</button><button data-f="review">Review</button><button data-f="translate">Dịch phim</button><button data-f="movie_studio">Studio phim</button>
      </div>
      <span class="meta" id="jcount"></span>
      <div class="seg post-filter" id="postFilter">
@@ -1293,6 +1800,13 @@ https://www.tiktok.com/@.../video/..."></textarea>
        <button class="btn" id="saveDouyinCookie">Lưu Douyin Cookie</button>
       </div>
       <div class="card">
+       <h2>Bilibili Cookie</h2><p class="d">Dùng tài khoản Bilibili đã có quyền xem với tập yêu cầu đăng nhập. Cookie chỉ lưu cục bộ trong <code>config.json</code> và không được ghi vào log.</p>
+       <label>Cookie đăng nhập Bilibili</label>
+       <input type="password" id="bilibiliCookie" autocomplete="off" placeholder="Dán toàn bộ Cookie header từ bilibili.tv">
+       <div class="meta" id="bilibiliCookieState" style="margin:7px 0 10px">Chưa kiểm tra</div>
+       <button class="btn" id="saveBilibiliCookie">Lưu Bilibili Cookie</button>
+      </div>
+      <div class="card">
        <h2>Vivibe API</h2><p class="d">Key dùng để tạo giọng đọc. Key được lưu cục bộ trong <code>config.json</code>.</p>
        <label>Vivibe API key</label>
        <input type="password" id="vivibeKey" autocomplete="off" placeholder="Dán key sk_live_...">
@@ -1336,11 +1850,12 @@ https://www.tiktok.com/@.../video/..."></textarea>
 <div class="toast" id="toast"></div>
 
 <script>
-const IC={home:'<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/>',remake:'<path d="M4 4v6h6"/><path d="M20 20v-6h-6"/><path d="M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3"/>',translate:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>',review:'<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M10 9l4 2-4 2z"/>',jobs:'<path d="M4 6h16M4 12h16M4 18h10"/>',fbposts:'<path d="M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z"/><path d="M14 8h-2a2 2 0 0 0-2 2v8M8 13h6"/>',set:'<circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.3 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.4 2.5a7 7 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.6a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.3-1a7 7 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7 7 0 0 0 1.7-1l2.3 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/>',log:'<path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'};
+const IC={home:'<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/>',discovery:'<path d="M12 2l2.2 6.2L20 10l-5.8 1.8L12 18l-2.2-6.2L4 10l5.8-1.8z"/>',remake:'<path d="M4 4v6h6"/><path d="M20 20v-6h-6"/><path d="M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3"/>',translate:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>',review:'<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M10 9l4 2-4 2z"/>',jobs:'<path d="M4 6h16M4 12h16M4 18h10"/>',fbposts:'<path d="M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z"/><path d="M14 8h-2a2 2 0 0 0-2 2v8M8 13h6"/>',set:'<circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.3 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.4 2.5a7 7 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.6a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.3-1a7 7 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7 7 0 0 0 1.7-1l2.3 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/>',log:'<path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'};
+IC.reup=IC.review;IC.studio='<path d="M3 5h18v14H3z"/><path d="M7 9h10M7 13h6"/>';IC.soundtrack='<path d="M9 18V5l10-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/>';
 let ME=null,NAV=[],FB_PAGES=[];
-const HINT={home:"",remake:"1 video → nhiều biến thể",translate:"nghe lời → dịch → phụ đề",review:"dán link → cắt ghép → video mới",jobs:"video đã làm + tiến trình",fbposts:"xem và quản lý bài trên Page",set:"chỉnh mặc định",log:"",account:"đổi mật khẩu và quản lý tài khoản"};
+const HINT={home:"",discovery:"đăng nhập local → quét → chọn nguồn",soundtrack:"video + âm thanh → video mới",remake:"1 video → nhiều biến thể",reup:"tóm tắt nội dung → hook 3 giây → render",translate:"nghe lời → dịch → phụ đề",studio:"tạo nháp → chỉnh sub → xác nhận render",review:"dán link → cắt ghép → video mới",jobs:"video đã làm + tiến trình",fbposts:"xem và quản lý bài trên Page",set:"chỉnh mặc định",log:"",account:"đổi mật khẩu và quản lý tài khoản"};
 const nav=document.getElementById("nav");
-function buildNav(){nav.innerHTML="";NAV=ME.role==="admin"?[["home","Tổng quan"],["fbposts","Bài viết Facebook"],["review","Tạo video"],["translate","Dịch phim"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["set","Cài đặt"],["log","Nhật ký"],["account","Tài khoản"]]:[["home","Tổng quan"],["review","Tạo video"],["translate","Dịch phim"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["account","Tài khoản"]];NAV.forEach(([k,t],i)=>{const d=document.createElement("div");d.className="nav"+(i==0?" on":"");d.dataset.k=k;
+function buildNav(){nav.innerHTML="";NAV=ME.role==="admin"?[["home","Tổng quan"],["discovery","Khám phá video"],["fbposts","Bài viết Facebook"],["review","Tạo video"],["soundtrack","Ghép âm thanh"],["reup","Reup video"],["translate","Dịch phim"],["studio","Studio phim"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["set","Cài đặt"],["log","Nhật ký"],["account","Tài khoản"]]:[["home","Tổng quan"],["discovery","Khám phá video"],["review","Tạo video"],["soundtrack","Ghép âm thanh"],["reup","Reup video"],["translate","Dịch phim"],["studio","Studio phim"],["jobs","Kết quả"],["remake","Làm lại 1 video"],["account","Tài khoản"]];NAV.forEach(([k,t],i)=>{const d=document.createElement("div");d.className="nav"+(i==0?" on":"");d.dataset.k=k;
  d.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${IC[k]}</svg><span>${t}</span>`+(k=="jobs"?'<span class="badge" id="navq" style="display:none"></span>':'');
  d.onclick=()=>go(k);nav.appendChild(d);});}
 function go(k){
@@ -1350,14 +1865,25 @@ function go(k){
  document.getElementById("ptitle").textContent=NAV.find(x=>x[0]==k)[1];
  document.getElementById("phint").textContent=HINT[k]||"";
  location.hash=k;
- if(k=="jobs")renderJobs(true);if(k=="fbposts")loadFacebookPosts(true);if(k=="log")loadLog();if(k=="home")loadHome();if(k=="account"&&ME.role==="admin")loadUsers();
+ if(k=="jobs")renderJobs(true);if(k=="studio")resumeMovieStudio();if(k=="fbposts")loadFacebookPosts(true);if(k=="log")loadLog();if(k=="home")loadHome();if(k=="discovery")loadDiscoveryAccounts();if(k=="account"&&ME.role==="admin")loadUsers();
 }
 window.addEventListener("hashchange",()=>{const k=location.hash.slice(1);if(k&&NAV.some(x=>x[0]==k))go(k);});
 
 function toast(m){const t=document.getElementById("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2600);}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-const BC={queued:"b-queued",running:"b-running",done:"b-done",error:"b-error"};
-const BT={queued:"⏳ chờ",running:'<span class="spin"></span> đang chạy',done:"✅ xong",error:"❌ lỗi"};
+async function apiFetch(url,options){const r=await fetch(url,options),text=await r.text();let data;try{data=JSON.parse(text);}catch(_){const clean=text.replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim().slice(0,180);throw new Error(`Máy chủ trả phản hồi không hợp lệ (HTTP ${r.status})${clean?' · '+clean:''}`);}if(!r.ok||data.ok===false)throw new Error(data.err||`Yêu cầu thất bại (HTTP ${r.status})`);return data;}
+function metric(n){n=Number(n||0);return n>=1000000?(n/1000000).toFixed(1)+"M":n>=1000?(n/1000).toFixed(1)+"K":String(n);}
+let DISCOVERY=[];
+async function loadDiscoveryAccounts(){const box=document.getElementById("discoverAccounts");box.innerHTML='<span class="d">Đang kiểm tra...</span>';try{const j=await apiFetch("/api/discovery/accounts");box.innerHTML=j.accounts.map(a=>`<div class="out" style="padding:10px;margin-top:7px;display:flex;align-items:center;gap:10px"><div style="flex:1"><b>${esc(a.name)}</b><div class="d">${a.active?'Trình duyệt đang mở':a.saved?'Đã lưu phiên đăng nhập':'Chưa đăng nhập'}${a.last_login?' · '+esc(a.last_login.replace('T',' ')):''}</div></div><button class="btn sm ghost discovery-account-login" data-platform="${a.platform}">${a.saved?'Đăng nhập lại':'Đăng nhập'}</button>${a.saved?`<button class="btn sm ghost discovery-account-delete" data-platform="${a.platform}" ${a.active?'disabled':''}>Xóa phiên</button>`:''}</div>`).join("");}catch(e){box.innerHTML='<span class="d">Lỗi: '+esc(e.message)+'</span>';}}
+function renderDiscovery(items){DISCOVERY=items||[];const box=document.getElementById("discoverResults");if(!DISCOVERY.length){box.innerHTML='<div class="discover-empty">Không tìm thấy video phù hợp. Hãy thử bỏ từ khóa hoặc đăng nhập lại.</div>';return;}box.innerHTML=DISCOVERY.map((v,i)=>`<article class="discover-card"><img src="${esc(v.thumbnail)}" alt="" loading="lazy" onerror="this.style.display='none'"><div class="dc-body"><h3 title="${esc(v.title)}">${esc(v.title)}</h3><div class="discover-meta"><span>${esc(v.author||v.platform)}</span><span>👁 ${metric(v.views)}</span><span>♥ ${metric(v.likes)}</span><span class="discover-score">Điểm ${Number(v.score).toFixed(1)}</span></div><div class="dc-foot"><input type="checkbox" class="discover-pick" data-i="${i}" aria-label="Chọn video"><a href="${esc(v.url)}" target="_blank" rel="noopener">Xem nguồn</a></div></div></article>`).join("");}
+document.getElementById("discoverLogin").onclick=async()=>{const platform=document.getElementById("discoverPlatform").value,b=document.getElementById("discoverLogin");b.disabled=true;try{await apiFetch("/api/discovery/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({platform})});toast("Đã mở cửa sổ đăng nhập");document.getElementById("discoverStatus").textContent="Hãy đăng nhập trong cửa sổ mới, sau đó đóng cửa sổ đó rồi bấm Quét.";}catch(e){toast("⚠ "+e.message);document.getElementById("discoverStatus").textContent="Lỗi: "+e.message;}finally{b.disabled=false;}};
+document.getElementById("discoverAccounts").onclick=async e=>{const login=e.target.closest(".discovery-account-login"),del=e.target.closest(".discovery-account-delete");if(login){document.getElementById("discoverPlatform").value=login.dataset.platform;document.getElementById("discoverLogin").click();setTimeout(loadDiscoveryAccounts,800);}if(del&&confirm("Xóa phiên đăng nhập đã lưu trên máy?")){del.disabled=true;try{await apiFetch(`/api/discovery/account/${del.dataset.platform}`,{method:"DELETE"});toast("Đã xóa phiên đăng nhập");await loadDiscoveryAccounts();}catch(err){toast("⚠ "+err.message);del.disabled=false;}}};
+document.getElementById("discoverSearch").onclick=async()=>{const b=document.getElementById("discoverSearch"),status=document.getElementById("discoverStatus");b.disabled=true;b.innerHTML='<span class="spin"></span> Đang quét...';status.textContent="Đang mở bảng thịnh hành và đọc dữ liệu hiển thị...";try{const body={platform:document.getElementById("discoverPlatform").value,topic:document.getElementById("discoverTopic").value,date:document.getElementById("discoverDate").value,limit:Number(document.getElementById("discoverLimit").value)},j=await apiFetch("/api/discovery/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});renderDiscovery(j.items);status.textContent=`Đã quét ${j.items.length} video lúc ${j.scanned_at.replace('T',' ')}${j.warning?' · '+j.warning:''}`;}catch(e){status.textContent="Lỗi: "+e.message;toast("⚠ "+e.message);}finally{b.disabled=false;b.textContent="Quét video thịnh hành";}};
+function moveDiscovery(target){const urls=[...document.querySelectorAll(".discover-pick:checked")].map(x=>DISCOVERY[Number(x.dataset.i)]?.url).filter(Boolean);if(!urls.length){toast("Hãy chọn ít nhất một video");return;}const form=document.getElementById(target==="review"?"f2":"f1"),area=form.querySelector('textarea[name="links"]');area.value=urls.join("\n");go(target);toast(`Đã chuyển ${urls.length} link sang ${target==="review"?"Review":"Remake"}`);}
+document.getElementById("discoverReview").onclick=()=>moveDiscovery("review");
+document.getElementById("discoverRemake").onclick=()=>moveDiscovery("remake");
+const BC={queued:"b-queued",running:"b-running",awaiting_review:"b-queued",done:"b-done",error:"b-error"};
+const BT={queued:"⏳ chờ",running:'<span class="spin"></span> đang chạy',awaiting_review:"✏️ chờ duyệt",done:"✅ xong",error:"❌ lỗi"};
 
 /* dropzone */
 function wireDrop(id){const l=document.getElementById(id);const inp=l.querySelector("input");
@@ -1367,8 +1893,18 @@ function wireDrop(id){const l=document.getElementById(id);const inp=l.querySelec
  l.ondrop=e=>{e.preventDefault();inp.files=e.dataTransfer.files;inp.onchange();};}
 wireDrop("d1");wireDrop("d2");
 wireDrop("d3");
+wireDrop("d4");
+wireDrop("d6");
 function syncProviderVoices(providerSelect){const voice=providerSelect.closest("form")?.querySelector('select[name="voice"]');if(!voice)return;const genmax=providerSelect.value==="genmax";[...voice.options].forEach(o=>{const isGenmax=o.value==="adam3"||o.value.startsWith("genmax_");const show=o.value==="auto"||(genmax?isGenmax:!isGenmax);o.hidden=!show;o.disabled=!show;});if(voice.selectedOptions[0]?.disabled)voice.value="auto";}
 document.querySelectorAll("[data-provider]").forEach(el=>{el.addEventListener("change",()=>syncProviderVoices(el));syncProviderVoices(el);});
+const studioSubMode=document.getElementById("studioOriginalSubtitles"),studioSubRegion=document.getElementById("studioSubtitleRegion"),studioFrameRatio=document.getElementById("studioFrameRatio"),studioTemplateFrame=document.getElementById("studioTemplateFrame"),studioTemplateBox=document.getElementById("studioTemplateBox"),studioTemplateInputs=["subtitle_region_x","subtitle_region_y","subtitle_region_width","subtitle_region_height"].map(name=>document.querySelector(`#f6 [name="${name}"]`));
+function studioTemplateValues(){return studioTemplateInputs.map(input=>Number(input.value));}
+function paintStudioTemplate(){const [x,y,w,h]=studioTemplateValues();studioTemplateBox.style.left=x+"%";studioTemplateBox.style.top=y+"%";studioTemplateBox.style.width=w+"%";studioTemplateBox.style.height=h+"%";}
+function syncStudioFrameRatio(){const [w,h]=studioFrameRatio.value.split(":").map(Number);studioTemplateFrame.style.aspectRatio=`${w}/${h}`;studioTemplateFrame.style.width=w<h?"230px":w===h?"360px":"520px";paintStudioTemplate();}
+function syncStudioSubRegion(){studioSubRegion.style.display=studioSubMode.value==="smart_custom"?"":"none";if(studioSubMode.value==="smart_custom")syncStudioFrameRatio();}
+studioSubMode.addEventListener("change",syncStudioSubRegion);studioFrameRatio.addEventListener("change",syncStudioFrameRatio);studioTemplateInputs.forEach(input=>input.addEventListener("input",paintStudioTemplate));
+(()=>{let start=null;const point=e=>{const r=studioTemplateFrame.getBoundingClientRect();return [Math.max(0,Math.min(100,(e.clientX-r.left)*100/r.width)),Math.max(0,Math.min(100,(e.clientY-r.top)*100/r.height))];};const update=(a,b)=>{const values=[Math.min(a[0],b[0]),Math.min(a[1],b[1]),Math.max(.1,Math.abs(b[0]-a[0])),Math.max(.1,Math.abs(b[1]-a[1]))];studioTemplateInputs.forEach((input,i)=>input.value=values[i].toFixed(1));paintStudioTemplate();};studioTemplateFrame.onpointerdown=e=>{start=point(e);studioTemplateFrame.setPointerCapture(e.pointerId);update(start,start);};studioTemplateFrame.onpointermove=e=>{if(start)update(start,point(e));};studioTemplateFrame.onpointerup=e=>{if(!start)return;update(start,point(e));studioTemplateFrame.releasePointerCapture(e.pointerId);start=null;toast("✓ Đã khoanh vùng sub cũ trên khung mẫu");};})();
+syncStudioSubRegion();
 
 async function submit(form,url,label){
  const btn=form.querySelector(".btn");btn.disabled=true;const old=btn.textContent;btn.innerHTML='<span class="spin"></span> Đang gửi...';
@@ -1379,11 +1915,48 @@ async function submit(form,url,label){
  }catch(e){toast("⚠ "+e);}
  btn.disabled=false;btn.textContent=old;
 }
+let STUDIO_JOB=localStorage.getItem("movieStudioJob")||"",STUDIO_DATA=null,STUDIO_TIMER=null,STUDIO_SOURCE=0;
+function studioState(text){const root=document.getElementById("studioProject"),state=document.getElementById("studioState");root.style.display="";state.textContent=text;}
+async function resumeMovieStudio(){
+ if(!STUDIO_JOB){try{const data=await apiFetch("/api/jobs"),job=(data.jobs||[]).find(item=>item.kind==="movie_studio"&&["queued","running","awaiting_review"].includes(item.status));if(job){STUDIO_JOB=job.id;localStorage.setItem("movieStudioJob",STUDIO_JOB);}}catch(_){}}
+ if(STUDIO_JOB)loadMovieStudio(STUDIO_JOB);
+}
+async function loadMovieStudio(id){
+ clearTimeout(STUDIO_TIMER);studioState("Đang đọc dự án "+id+"...");
+ try{const data=await apiFetch(`/api/movie-studio/${encodeURIComponent(id)}`);STUDIO_DATA=data;
+  if(data.status==="queued"||data.status==="running"){document.getElementById("studioEditor").style.display="none";studioState(data.status==="queued"?"Bản nháp đang chờ xử lý...":"Đang nghe, dịch và tạo bản nháp...");STUDIO_TIMER=setTimeout(()=>loadMovieStudio(id),2500);return;}
+  if(data.status==="awaiting_review"){studioState(`Bản nháp #${data.draft_version} đã sẵn sàng · ${data.drafts.length} nguồn`);document.getElementById("studioEditor").style.display="";const select=document.getElementById("studioSource");select.innerHTML=data.drafts.map((d,i)=>`<option value="${i}">${i+1}. ${esc(d.title||"Video")}</option>`).join("");STUDIO_SOURCE=Math.min(STUDIO_SOURCE,Math.max(0,data.drafts.length-1));select.value=String(STUDIO_SOURCE);document.getElementById("studioReviewSubtitleMode").value=data.original_subtitles||"smart_bottom";writeStudioRegion(data.subtitle_region||[5,70,90,25]);syncStudioReviewRegion();renderStudioSource();return;}
+  document.getElementById("studioEditor").style.display="none";studioState(data.status==="done"?"Dự án đã render xong. Xem video trong mục Kết quả.":"Dự án lỗi: "+(data.error||"không rõ lỗi"));
+ }catch(err){studioState("Không đọc được dự án: "+err.message);}
+}
+function readStudioRegion(){const ids=["studioRegionX","studioRegionY","studioRegionW","studioRegionH"],values=ids.map(id=>Number(document.getElementById(id).value));return values.every(Number.isFinite)?values.map(v=>Math.round(v*100)/100):null;}
+function writeStudioRegion(region){["studioRegionX","studioRegionY","studioRegionW","studioRegionH"].forEach((id,i)=>document.getElementById(id).value=Number(region[i]).toFixed(1));paintStudioRegion();}
+function paintStudioRegion(){const region=readStudioRegion(),box=document.getElementById("studioRegionBox"),custom=document.getElementById("studioReviewSubtitleMode").value==="smart_custom";if(!custom||!region){box.style.display="none";return;}box.style.display="";box.style.left=region[0]+"%";box.style.top=region[1]+"%";box.style.width=region[2]+"%";box.style.height=region[3]+"%";}
+function syncStudioReviewRegion(){const custom=document.getElementById("studioReviewSubtitleMode").value==="smart_custom";document.getElementById("studioReviewRegionValues").style.display=custom?"":"none";document.getElementById("studioPickRegion").style.display=custom?"":"none";document.getElementById("studioRegionHelp").style.display=custom?"":"none";if(!custom)document.getElementById("studioRegionLayer").classList.remove("picking");paintStudioRegion();}
+document.getElementById("studioReviewSubtitleMode").addEventListener("change",syncStudioReviewRegion);
+document.querySelectorAll("#studioReviewRegionValues input").forEach(input=>input.addEventListener("input",paintStudioRegion));
+document.getElementById("studioPickRegion").onclick=()=>{const layer=document.getElementById("studioRegionLayer");layer.classList.add("picking");toast("Kéo chuột để khoanh vùng sub cũ");};
+(()=>{const layer=document.getElementById("studioRegionLayer");let start=null;const point=e=>{const r=layer.getBoundingClientRect();return [Math.max(0,Math.min(100,(e.clientX-r.left)*100/r.width)),Math.max(0,Math.min(100,(e.clientY-r.top)*100/r.height))];};layer.onpointerdown=e=>{if(!layer.classList.contains("picking"))return;start=point(e);layer.setPointerCapture(e.pointerId);writeStudioRegion([start[0],start[1],.1,.1]);};layer.onpointermove=e=>{if(!start)return;const end=point(e),x=Math.min(start[0],end[0]),y=Math.min(start[1],end[1]);writeStudioRegion([x,y,Math.max(.1,Math.abs(end[0]-start[0])),Math.max(.1,Math.abs(end[1]-start[1]))]);};layer.onpointerup=e=>{if(!start)return;layer.releasePointerCapture(e.pointerId);start=null;layer.classList.remove("picking");paintStudioRegion();toast("✓ Đã chọn vùng sub cũ");};})();
+function renderStudioSource(){
+ const draft=STUDIO_DATA?.drafts?.[STUDIO_SOURCE];if(!draft)return;const video=document.getElementById("studioVideo");video.src=draft.preview_url;
+ const baseVoice=document.querySelector('#f6 select[name="voice"]');const voiceOptions=s=>'<option value="">Dùng giọng mặc định</option>'+[...(baseVoice?.options||[])].map(o=>`<option value="${esc(o.value)}" ${o.value===(s.voice||"")?"selected":""}>${esc(o.textContent)}</option>`).join("");
+ const box=document.getElementById("studioSegments");box.innerHTML='<div class="studio-segment-head"><span>Nhân vật</span><span>Giọng</span><span>Bắt đầu</span><span>Kết thúc</span><span>Lời gốc</span><span>Lời dịch / thuyết minh</span></div>'+draft.segments.map((s,i)=>`<div class="studio-segment" data-i="${i}"><input class="seg-speaker" maxlength="80" value="${esc(s.speaker||"Nhân vật 1")}" placeholder="Tên nhân vật"><select class="seg-voice">${voiceOptions(s)}</select><input class="seg-start" type="number" min="0" step="0.001" value="${Number(s.start).toFixed(3)}"><input class="seg-end" type="number" min="0" step="0.001" value="${Number(s.end).toFixed(3)}"><textarea class="seg-original">${esc(s.text)}</textarea><textarea class="seg-translated">${esc(s.translated)}</textarea></div>`).join("");
+ box.onclick=e=>{if(e.target.matches("input,textarea,select,option"))return;const row=e.target.closest(".studio-segment");if(!row)return;const start=Number(row.querySelector(".seg-start").value||0),end=Number(row.querySelector(".seg-end").value||start);video.currentTime=start;video.play();const stop=()=>{if(video.currentTime>=end){video.pause();video.removeEventListener("timeupdate",stop);}};video.addEventListener("timeupdate",stop);};
+}
+function captureStudioSource(){const draft=STUDIO_DATA?.drafts?.[STUDIO_SOURCE];if(!draft)return;draft.segments=[...document.querySelectorAll("#studioSegments .studio-segment")].map((row,i)=>({id:i,speaker:row.querySelector(".seg-speaker").value.trim(),voice:row.querySelector(".seg-voice").value,start:Number(row.querySelector(".seg-start").value),end:Number(row.querySelector(".seg-end").value),text:row.querySelector(".seg-original").value,translated:row.querySelector(".seg-translated").value}));}
+document.getElementById("studioSource").onchange=e=>{captureStudioSource();STUDIO_SOURCE=Number(e.target.value);renderStudioSource();};
+async function saveStudioDraft(show=true){captureStudioSource();const mode=document.getElementById("studioReviewSubtitleMode").value,region=mode==="smart_custom"?readStudioRegion():null;const result=await apiFetch(`/api/movie-studio/${encodeURIComponent(STUDIO_JOB)}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({original_subtitles:mode,subtitle_region:region,drafts:STUDIO_DATA.drafts.map(d=>({index:d.index,segments:d.segments}))})});STUDIO_DATA.draft_version=result.draft_version;STUDIO_DATA.original_subtitles=mode;STUDIO_DATA.subtitle_region=region;if(show)toast("✓ Đã lưu bản nháp #"+result.draft_version);return result;}
+document.getElementById("studioSave").onclick=async()=>{const button=document.getElementById("studioSave");button.disabled=true;try{await saveStudioDraft();}catch(err){toast("⚠ "+err.message);}finally{button.disabled=false;}};
+document.getElementById("studioConfirm").onclick=async()=>{if(!confirm("Lưu bản nháp hiện tại và bắt đầu render? Sau bước này không thể sửa tiếp."))return;const button=document.getElementById("studioConfirm");button.disabled=true;try{await saveStudioDraft(false);await apiFetch(`/api/movie-studio/${encodeURIComponent(STUDIO_JOB)}/confirm`,{method:"POST"});toast("✓ Đã xác nhận, dự án được đưa vào hàng render");go("jobs");}catch(err){toast("⚠ "+err.message);button.disabled=false;}};
+document.getElementById("f6").addEventListener("submit",async e=>{e.preventDefault();const form=e.target,button=form.querySelector("button[type=submit]"),old=button.textContent;button.disabled=true;button.innerHTML='<span class="spin"></span> Đang gửi...';try{const response=await fetch("/api/movie-studio",{method:"POST",body:new FormData(form)}),data=await response.json();if(!response.ok||!data.ok)throw new Error(data.err||"Không tạo được dự án");STUDIO_JOB=data.id;localStorage.setItem("movieStudioJob",STUDIO_JOB);toast("✓ Đã tạo dự án Studio phim");loadMovieStudio(STUDIO_JOB);}catch(err){toast("⚠ "+err.message);}finally{button.disabled=false;button.textContent=old;}});
 document.getElementById("f1").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/remake");});
 document.getElementById("f2").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/review");});
 document.getElementById("f3").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/translate");});
-function syncMovieMode(){const mode=document.querySelector('#f3 input[name="task_mode"]:checked')?.value||"summary",summary=mode==="summary",target=document.getElementById("movieTargetLanguage");document.getElementById("translateOptions").style.display=summary?"none":"";document.getElementById("summaryOptions").style.display=summary?"":"none";if(summary){target.value="vi";target.disabled=true;}else target.disabled=false;}
-document.querySelectorAll('#f3 input[name="task_mode"]').forEach(el=>el.addEventListener("change",syncMovieMode));syncMovieMode();
+document.getElementById("f4").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/reup");});
+document.getElementById("f5").addEventListener("submit",e=>{e.preventDefault();submit(e.target,"/api/soundtrack");});
+function syncMovieMode(){const mode=document.querySelector('#f3 input[name="task_mode"]:checked')?.value||"summary",summary=mode==="summary",output=document.getElementById("movieTranslationOutput"),dub=["dub","dub_srt","all"].includes(output.value),target=document.getElementById("movieTargetLanguage"),original=document.getElementById("movieOriginalOutput");document.getElementById("translateOptions").style.display=summary?"none":"";document.getElementById("summaryOptions").style.display=summary?"":"none";document.getElementById("movieVoiceOptions").style.display=(summary||dub)?"":"none";if(summary||dub){target.value="vi";target.disabled=true;}else target.disabled=false;const noTranslation=target.value==="none";original.hidden=!noTranslation;original.disabled=!noTranslation;if(!noTranslation&&output.value==="original")output.value="both";}
+function syncMovieTarget(){const target=document.getElementById("movieTargetLanguage"),output=document.getElementById("movieTranslationOutput"),original=document.getElementById("movieOriginalOutput");if(target.value==="none"){original.hidden=false;original.disabled=false;output.value="original";document.getElementById("movieOriginalSubtitles").value="keep";}syncMovieMode();}
+document.querySelectorAll('#f3 input[name="task_mode"]').forEach(el=>el.addEventListener("change",syncMovieMode));document.getElementById("movieTranslationOutput").addEventListener("change",syncMovieMode);document.getElementById("movieTargetLanguage").addEventListener("change",syncMovieTarget);syncMovieTarget();
 
 /* ===== jobs: cập nhật CÓ CHỌN LỌC (chống nháy) ===== */
 let curFilter="all",postFilter="all";
@@ -1398,7 +1971,7 @@ let jobsData=[];
 function jobCardHTML(j){
  const exp=j.expected||0, pct=exp?Math.min(100,Math.round(j.n_out/exp*100)):(j.status=="done"?100:0);
  const showbar=(j.status=="running"||j.status=="queued")&&exp>0;
- const kindLabel=j.kind==="remake"?"🎬 Làm lại":j.kind==="translate"?"🌐 Dịch phim":"🎬 Tạo video";
+ const kindLabel=j.kind==="remake"?"🎬 Làm lại":j.kind==="translate"?"🌐 Dịch phim":j.kind==="movie_studio"?"🎞️ Studio phim":j.kind==="reup"?"🚀 Reup video":"🎬 Tạo video";
  return `<div class="h"><span class="kind">${kindLabel}</span>
    <span class="badge2 ${BC[j.status]||''}">${BT[j.status]||j.status}</span>
    <span style="margin-left:auto" class="meta">${j.n_in} nguồn → <b style="color:var(--fg)">${j.n_out}${exp?("/"+exp):""}</b> video ${j.product?("· "+j.product):""}</span></div>
@@ -1545,6 +2118,7 @@ async function loadSettings(){const r=await fetch("/api/settings");const s=await
  const ks=document.getElementById("vivibeKeyState");if(ks)ks.textContent=s.vivibe_key_set?"✅ Đã có API key":"⚠ Chưa có API key";
  const gs=document.getElementById("genmaxKeyState");if(gs)gs.textContent=s.genmax_key_set?"✅ Đã có API key":"⚠ Chưa có API key";
  const ds=document.getElementById("douyinCookieState");if(ds)ds.textContent=s.douyin_cookie_set?"✅ Đã có Douyin Cookie":"⚠ Chưa có Douyin Cookie";
+ const bs=document.getElementById("bilibiliCookieState");if(bs)bs.textContent=s.bilibili_cookie_set?"✅ Đã có Bilibili Cookie":"⚠ Chưa có Bilibili Cookie";
  FB_PAGES=s.facebook_pages||[];syncPostsPages();const fs=document.getElementById("facebookState");if(fs)fs.textContent=FB_PAGES.length?`✅ Đã cấu hình ${FB_PAGES.length} Page`:"⚠ Chưa có Facebook Page";renderFacebookPages();}
 function renderFacebookPages(){const box=document.getElementById("facebookPageList");if(!box)return;box.innerHTML=FB_PAGES.length?FB_PAGES.map(p=>`<div class="fb-page-row"><span><b>${esc(p.name||p.id)}</b><small>${esc(p.id)}</small></span><button class="btn sm ghost test-fb-page" data-id="${esc(p.id)}">Kiểm tra</button><button class="btn sm ghost delete-fb-page" data-id="${esc(p.id)}">Xoá</button></div>`).join(""):'<div class="meta">Chưa thêm Page nào.</div>';}
 document.getElementById("saveSet").onclick=async()=>{
@@ -1557,6 +2131,7 @@ document.getElementById("saveVivibe").onclick=async()=>{const el=document.getEle
  const s=await r.json();if(s.vivibe_key_set){el.value="";toast("✅ Đã lưu Vivibe API key");loadSettings();}else toast("⚠ Không lưu được API key");};
 document.getElementById("saveGenmax").onclick=async()=>{const el=document.getElementById("genmaxKey"),key=el.value.trim();if(!key){toast("⚠ Hãy dán GenMax API key");return;}const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genmax_api_key:key})}),s=await r.json();if(s.genmax_key_set){el.value="";toast("✅ Đã lưu GenMax API key");loadSettings();document.getElementById("credits").dataset.loaded="";}else toast("⚠ Không lưu được API key");};
 document.getElementById("saveDouyinCookie").onclick=async()=>{const el=document.getElementById("douyinCookie"),cookie=el.value.trim();if(!cookie){toast("⚠ Hãy dán Douyin Cookie");return;}const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({douyin_cookie:cookie})}),s=await r.json();if(s.douyin_cookie_set){el.value="";toast("✅ Đã lưu Douyin Cookie");loadSettings();}else toast("⚠ Không lưu được Douyin Cookie");};
+document.getElementById("saveBilibiliCookie").onclick=async()=>{const el=document.getElementById("bilibiliCookie"),cookie=el.value.trim();if(!cookie){toast("⚠ Hãy dán Bilibili Cookie");return;}const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({bilibili_cookie:cookie})}),s=await r.json();if(s.bilibili_cookie_set){el.value="";toast("✅ Đã lưu Bilibili Cookie");loadSettings();}else toast("⚠ Không lưu được Bilibili Cookie");};
 document.getElementById("saveFacebook").onclick=async()=>{const pageId=document.getElementById("facebookPageId").value.trim(),pageName=document.getElementById("facebookPageName").value.trim(),token=document.getElementById("facebookToken").value.trim();if(!pageId){toast("⚠ Hãy nhập Page ID");return;}const payload={facebook_page_id:pageId,facebook_page_name:pageName};if(token)payload.facebook_page_access_token=token;const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const s=await r.json();if(s.facebook_key_set){document.getElementById("facebookToken").value="";document.getElementById("facebookPageId").value="";document.getElementById("facebookPageName").value="";toast("✅ Đã lưu Facebook Page");await loadSettings();Object.keys(sigCache).forEach(k=>delete sigCache[k]);renderJobs(true);}else toast("⚠ Page mới cần Page Access Token");};
 document.getElementById("facebookPageList").onclick=async e=>{const test=e.target.closest(".test-fb-page"),del=e.target.closest(".delete-fb-page");if(test){test.disabled=true;const r=await fetch("/api/facebook/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({page_id:test.dataset.id})});const s=await r.json();test.disabled=false;toast(s.ok?`✅ Đã kết nối: ${s.page_name}`:`⚠ ${s.err||"Kết nối thất bại"}`);}if(del&&confirm("Xoá Page này khỏi tool?")){await fetch("/api/facebook/pages/"+encodeURIComponent(del.dataset.id),{method:"DELETE"});await loadSettings();Object.keys(sigCache).forEach(k=>delete sigCache[k]);renderJobs(true);}};
 fetch("/api/overview").then(r=>r.json()).then(o=>{const e=document.getElementById("outdir");if(e)e.textContent=o.out_dir||"output/";});
@@ -1568,7 +2143,7 @@ async function loadUsers(){const r=await fetch("/api/users");if(!r.ok)return;con
 document.getElementById("addUser").onclick=async()=>{const username=document.getElementById("newUsername").value,password=document.getElementById("newUserPass").value,role=document.getElementById("newRole").value;const r=await fetch("/api/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username,password,role})});const j=await r.json();toast(j.ok?"✅ Đã tạo tài khoản":"⚠ "+(j.err||"Lỗi"));if(j.ok){document.getElementById("newUsername").value="";document.getElementById("newUserPass").value="";loadUsers();}};
 document.getElementById("userList").onclick=async e=>{const reset=e.target.closest(".reset-user"),del=e.target.closest(".delete-user");if(reset){const password=prompt("Mật khẩu mới cho "+reset.dataset.u+" (ít nhất 8 ký tự):");if(!password)return;const r=await fetch("/api/users/"+encodeURIComponent(reset.dataset.u),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({password})});const j=await r.json();toast(j.ok?"✅ Đã đặt lại mật khẩu":"⚠ "+(j.err||"Lỗi"));}if(del&&confirm("Xoá tài khoản "+del.dataset.u+"? Video cũ vẫn được giữ.")){const r=await fetch("/api/users/"+encodeURIComponent(del.dataset.u),{method:"DELETE"});const j=await r.json();toast(j.ok?"✅ Đã xoá tài khoản":"⚠ "+(j.err||"Lỗi"));if(j.ok)loadUsers();}};
 
-async function boot(){const r=await fetch("/api/me");if(r.status===401){location.href="/login";return;}ME=await r.json();document.getElementById("who").textContent=ME.username;document.getElementById("role").textContent=ME.role.toUpperCase();document.getElementById("adminUsers").style.display=ME.role==="admin"?"":"none";buildNav();if(ME.role==="admin")loadSettings();poll();const h=location.hash.slice(1);go(h&&NAV.some(x=>x[0]==h)?h:(ME.must_change_password?"account":"home"));if(ME.must_change_password)toast("⚠ Hãy đổi mật khẩu mặc định ngay");}
+async function boot(){const r=await fetch("/api/me");if(r.status===401){location.href="/login";return;}ME=await r.json();document.getElementById("who").textContent=ME.username;document.getElementById("role").textContent=ME.role.toUpperCase();document.getElementById("adminUsers").style.display=ME.role==="admin"?"":"none";const today=new Date().toISOString().slice(0,10),day=document.getElementById("discoverDate");day.value=today;day.max=today;buildNav();if(ME.role==="admin")loadSettings();poll();const h=location.hash.slice(1);go(h&&NAV.some(x=>x[0]==h)?h:(ME.must_change_password?"account":"home"));if(ME.must_change_password)toast("⚠ Hãy đổi mật khẩu mặc định ngay");}
 boot();
 </script></body></html>"""
 
@@ -1582,8 +2157,15 @@ _VOICE=[("auto","Tự động (theo niche)"),
         ("vbee_chinh","Chinh review (Vivibe)"),("vbee_ly","Ly tâm lý (Vivibe)"),("vbee_ha","Hà review (Vivibe)"),
         ("nam","Nam tự động (Vivibe)"),("nu","Nữ tự động (Vivibe)"),("nam1","nam1 (Vivibe)"),("nam3","nam3 (Vivibe)"),
         ("nam4","nam4 (Vivibe)"),("nam5","nam5 (Vivibe)"),("nam6","nam6 (Vivibe)"),("nu2","nu2 (Vivibe)"),
-        ("adam3","Adam - Dominant, Firm (GenMax)"),("genmax_duyen","Duyên (GenMax)"),
-        ("genmax_anhthu","Anh Thư (GenMax)"),("genmax_mai","Mai (GenMax)"),("genmax_thanhngoc","Thanh Ngọc (GenMax)")]
+        ("adam3","Adam - Dominant, Firm (GenMax)"),("genmax_vu","Vũ - Northern region (GenMax)"),("genmax_ninhdon","Ninh Đôn – Deep & Warm (GenMax)"),("genmax_duyen","Duyên (GenMax)"),
+        ("genmax_anhthu","Anh Thư (GenMax)"),("genmax_mai","Mai (GenMax)"),("genmax_thanhngoc","Thanh Ngọc (GenMax)"),
+        ("genmax_minimax_serene_man","Serene Man (MiniMax/GenMax)"),("genmax_minimax_crisp_announcer_v2","Crisp Announcer v2 (MiniMax/GenMax)"),
+        ("genmax_capcut_cute_female","Cute Female (CapCut/GenMax)"),("genmax_capcut_sweet_girl","Sweet Little Girl (CapCut/GenMax)"),
+        ("genmax_capcut_female_standard","Giọng nữ phổ thông (CapCut/GenMax)"),("genmax_capcut_confident_male","Confident Male (CapCut/GenMax)"),
+        ("genmax_capcut_chi_mai","Chí Mai (CapCut/GenMax)"),("genmax_capcut_trung_caha","Trung Caha (CapCut/GenMax)"),
+        ("genmax_capcut_nam_tram","Nam Trầm (CapCut/GenMax)"),("genmax_capcut_ly_nam","Ly Nam (CapCut/GenMax)"),
+        ("genmax_capcut_duy_bac","Duy Bắc (CapCut/GenMax)"),("genmax_capcut_ha_nu","Hà Nữ (CapCut/GenMax)"),
+        ("genmax_capcut_sai_nu","Sài Nữ (CapCut/GenMax)"),("genmax_capcut_anh_dung","Anh Dũng (CapCut/GenMax)")]
 _HOOK=[("auto","Tự động (não chọn)"),("pain_point","Nỗi đau"),("ket_qua_gay_to_mo","Kết quả tò mò"),
        ("cau_hoi","Câu hỏi"),("tinh_huong_that","Tình huống thật")]
 _FLIP=[("auto","Tự động xoay vòng"),("none","Giữ gốc"),("hflip","Lật gương"),("zoom","Zoom 12%"),

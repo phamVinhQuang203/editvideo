@@ -18,11 +18,18 @@ def subtitle_band(height, position):
     return int(height * 0.72), height
 
 
-def text_mask(frame, position):
+def text_mask(frame, position, region=None):
     """Tao mask hep quanh net chu sang/mau co tuong phan cao."""
     height, width = frame.shape[:2]
-    y0, y1 = subtitle_band(height, position)
-    band = frame[y0:y1]
+    if region:
+        x0 = max(0, min(width - 1, int(width * region[0] / 100)))
+        y0 = max(0, min(height - 1, int(height * region[1] / 100)))
+        x1 = max(x0 + 1, min(width, int(width * (region[0] + region[2]) / 100)))
+        y1 = max(y0 + 1, min(height, int(height * (region[1] + region[3]) / 100)))
+    else:
+        x0, x1 = 0, width
+        y0, y1 = subtitle_band(height, position)
+    band = frame[y0:y1, x0:x1]
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
     local_max = cv2.dilate(gray, np.ones((5, 5), np.uint8))
@@ -33,7 +40,8 @@ def text_mask(frame, position):
     seed = ((bright | colored).astype(np.uint8) * 255)
 
     # Subtitle thuong nam o trung tam; tranh xoa icon/UI sat hai mep.
-    edge = max(2, int(width * 0.035))
+    band_width = x1 - x0
+    edge = max(2, int(band_width * 0.035))
     seed[:, :edge] = 0
     seed[:, width - edge:] = 0
     count, labels, stats, _ = cv2.connectedComponentsWithStats(seed, 8)
@@ -41,15 +49,15 @@ def text_mask(frame, position):
     max_height = max(5, int(height * 0.09))
     for label in range(1, count):
         x, y, w, h, area = stats[label]
-        if 3 <= area <= width * max_height * 0.25 and 2 <= h <= max_height and w <= width * 0.35:
+        if 3 <= area <= band_width * max_height * 0.25 and 2 <= h <= max_height and w <= band_width * 0.35:
             kept[labels == label] = 255
     kept = cv2.dilate(kept, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 5)), iterations=2)
     mask = np.zeros((height, width), np.uint8)
-    mask[y0:y1] = kept
+    mask[y0:y1, x0:x1] = kept
     return mask
 
 
-def clean_video(source, destination, position):
+def clean_video(source, destination, position, region=None):
     capture = cv2.VideoCapture(source)
     if not capture.isOpened():
         raise RuntimeError("cannot open input video")
@@ -67,7 +75,7 @@ def clean_video(source, destination, position):
             ok, frame = capture.read()
             if not ok:
                 break
-            mask = text_mask(frame, position)
+            mask = text_mask(frame, position, region)
             cleaned = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA) if np.any(mask) else frame
             writer.write(cleaned)
             frames += 1
@@ -96,8 +104,9 @@ def main():
     parser.add_argument("source")
     parser.add_argument("destination")
     parser.add_argument("--position", choices=("top", "bottom"), default="bottom")
+    parser.add_argument("--region", nargs=4, type=float, metavar=("X", "Y", "WIDTH", "HEIGHT"))
     args = parser.parse_args()
-    clean_video(args.source, args.destination, args.position)
+    clean_video(args.source, args.destination, args.position, args.region)
 
 
 if __name__ == "__main__":

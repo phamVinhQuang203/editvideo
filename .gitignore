@@ -8,6 +8,7 @@ jobs/
 work/
 logs/
 analysis_cache/
+.browser_profiles/
 .tmp_*/
 venv/
 .f2-venv/

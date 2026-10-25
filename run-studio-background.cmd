@@ -1,9 +1,4 @@
 @echo off
-setlocal
-cd /d "%~dp0"
-set "VPY=python"
-if exist "venv\Scripts\python.exe" set "VPY=venv\Scripts\python.exe"
-if not exist "venv\Scripts\python.exe" if exist "E:\CODEX\autovoice-tool\.venv\Scripts\python.exe" set "VPY=E:\CODEX\autovoice-tool\.venv\Scripts\python.exe"
-
-set "PYTHONIOENCODING=utf-8"
-"%VPY%" "app\server.py" >nul 2>&1
+REM Khong con cho phep chay ngam. Chuyen sang script foreground de
+REM server dung ngay khi nguoi dung dong terminal hoac nhan Ctrl+C.
+call "%~dp0start-studio.cmd"

@@ -22,6 +22,15 @@ class LocalSubtitleRemovalTests(unittest.TestCase):
         self.assertEqual((0, 240), remover.subtitle_band(1000, "top"))
         self.assertEqual((720, 1000), remover.subtitle_band(1000, "bottom"))
 
+    def test_custom_region_limits_mask_to_selected_rectangle(self):
+        frame = np.zeros((200, 320, 3), dtype=np.uint8)
+        cv2.putText(frame, "OUT", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 2)
+        cv2.putText(frame, "SUB", (125, 165), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 2)
+        mask = remover.text_mask(frame, "bottom", [30, 65, 50, 25])
+        self.assertEqual(0, int(mask[:120].max()))
+        self.assertEqual(0, int(mask[:, :90].max()))
+        self.assertGreater(int(mask[130:180, 95:256].max()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

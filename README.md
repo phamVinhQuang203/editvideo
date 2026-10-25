@@ -20,8 +20,9 @@ mới + tự viết lời và đọc voice tiếng Việt. **Không đăng bài*
 
 ## Dùng hằng ngày
 
-- Bấm **`start-studio.cmd`** (hoặc `start-studio-hidden.vbs` để chạy ẩn) → mở trình duyệt
+- Mở terminal tại thư mục project rồi chạy **`start-studio.cmd`** → mở trình duyệt
   **http://127.0.0.1:7995**.
+- Giữ terminal mở trong lúc sử dụng; nhấn `Ctrl+C` hoặc đóng terminal để dừng server.
 - Vào **Tạo video**: dán link (nhiều video cùng 1 sản phẩm) → chọn số bản / hook → bấm **Tạo video**.
 - Xem và tải kết quả ở tab **Kết quả**.
 

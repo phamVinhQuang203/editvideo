@@ -3,8 +3,53 @@
 Mỗi biến thể: lời thoại Việt khác (theo style/hook) + giọng + lật hình khác -> FB thấy khác.
 Option: hook_type, voice, flip(lật), style, số biến thể, niche.
 """
-import os, time, random, shutil, traceback
+import os, re, time, random, shutil, traceback
 import engine as E
+
+
+CREATIVE_DIRECTIONS = (
+    "Mở bằng một chi tiết nhỏ dễ bị bỏ qua trên hình; triển khai theo quan sát → bất ngờ → kết luận.",
+    "Đặt người xem vào một tình huống sử dụng rất cụ thể; kể theo vấn đề → thao tác → kết quả.",
+    "Đi thẳng vào kết quả nổi bật nhất; sau đó giải thích ngược lại vì sao sản phẩm làm được như vậy.",
+    "Kể như trải nghiệm lần đầu dùng: nghi ngờ ban đầu → thử thật → thay đổi đánh giá.",
+    "Tập trung vào một lợi ích ít người nhắc tới; dùng chi tiết nhìn thấy trong video để chứng minh.",
+    "So sánh ngắn trạng thái trước và sau khi dùng; tránh liệt kê tính năng theo kiểu quảng cáo.",
+    "Mở bằng một nhận định trái kỳ vọng nhưng đúng với hình; giải thích bằng diễn biến của video.",
+    "Kể một câu chuyện mini có bối cảnh, hành động và kết quả; mỗi phần chỉ giữ một ý chính.",
+)
+
+
+def script_similarity(left, right):
+    """Jaccard trên cụm 3 từ, đủ rẻ để phát hiện hai lời thoại gần như paraphrase."""
+    def grams(value):
+        words = re.findall(r"\w+", str(value or "").lower(), flags=re.UNICODE)
+        if len(words) < 3:
+            return set(words)
+        return {tuple(words[i:i + 3]) for i in range(len(words) - 2)}
+
+    a, b = grams(left), grams(right)
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def creative_note(index, total, previous_scripts=()):
+    direction = CREATIVE_DIRECTIONS[index % len(CREATIVE_DIRECTIONS)]
+    note = (
+        f"YÊU CẦU ĐA DẠNG — đây là bản {index + 1}/{total}. "
+        f"CẤU TRÚC RIÊNG CỦA BẢN NÀY: {direction} "
+        "Không dùng bố cục mở bài, thứ tự luận điểm hay câu kết khuôn mẫu của các bản khác. "
+        "Chỉ chọn 2-3 chi tiết đắt giá thay vì liệt kê mọi công dụng."
+    )
+    openings = [re.sub(r"\s+", " ", text).strip()[:180] for text in previous_scripts[-3:]]
+    if openings:
+        note += "\nCÁC BẢN ĐÃ CÓ — cấm viết lại/paraphrase các cách mở và đường dây này:\n- " + "\n- ".join(openings)
+    return note
+
+
+def prepare_audio(brain_result, source, workdir, remove_original_audio=False):
+    if remove_original_audio:
+        return {"original": 0.0, "bed": None, "bedvol": 0.0}
+    return E.autovoice_audio(
+        brain_result.get("loai_audio", "mixed_voice_music"), source, workdir)
 
 def _prep_source(item, wd):
     """item: {'type':'file'|'link','path'/'url','name'}. Trả (src_mp4, meta)."""
@@ -51,7 +96,7 @@ def run_remake(job, save):
             "diem": br.get("diem_tiem_nang"), "form": br.get("form"), "dur": round(dur,1)}
         save(job)
 
-        au = E.autovoice_audio(br.get("loai_audio","mixed_voice_music"), src, wd)
+        au = prepare_audio(br, src, wd, bool(o.get("remove_original_audio")))
         blur = E.blur_regions(src, wd)
         if blur: E.log(f"[{job['id']}] blur {len(blur)//2} vùng chữ TQ", job); save(job)
 
@@ -62,14 +107,32 @@ def run_remake(job, save):
         else:
             styles = [o["style"]] * n
 
+        requested_hook = o.get("hook", "auto")
+        if requested_hook == "auto":
+            preferred_hook = br.get("hook_type") or E.HOOKS[0]
+            hook_pool = [preferred_hook] + [value for value in E.HOOKS if value != preferred_hook]
+            hooks = [hook_pool[j % len(hook_pool)] for j in range(n)]
+        else:
+            hooks = [requested_hook] * n
+
         vi = 0
+        previous_scripts = []
         for j in range(n):
             st = styles[j]
-            hook = o.get("hook","auto")
-            hook = ("" if hook == "auto" else hook)   # "" -> dùng hook của não
+            hook = hooks[j]
             voice_id, vlabel = E.voice_from_choice(o.get("voice","auto"), niche, vi); vi += 1
             E.log(f"[{job['id']}] biến thể {j+1}/{n}: viết lời ({st}) + render giọng {vlabel}...", job); save(job)
-            script, ht = E.write_script(br, zh, contact, dur, hook_type=hook, style_key=st)
+            note = creative_note(j, n, previous_scripts)
+            script, ht = E.write_script(br, zh, contact, dur, hook_type=hook,
+                                        style_key=st, extra_note=note)
+            similarity = max((script_similarity(script, old) for old in previous_scripts), default=0.0)
+            if similarity >= 0.42:
+                E.log(f"[{job['id']}] biến thể {j+1} giống bản trước {similarity:.0%}, viết lại...", job)
+                retry_note = (note + "\nBẢN VỪA SINH BỊ ĐÁNH GIÁ QUÁ GIỐNG BẢN TRƯỚC. "
+                              "Hãy đổi hẳn câu mở, góc kể, thứ tự ý và câu kết; không chỉ thay từ đồng nghĩa.")
+                script, ht = E.write_script(br, zh, contact, dur, hook_type=hook,
+                                            style_key=st, extra_note=retry_note)
+            previous_scripts.append(script)
             sp = os.path.join(wd, f"script_{j}.txt"); open(sp,"w",encoding="utf-8").write(script)
             base = os.path.join(wd, f"base_{j}.mp4")
             r = E.render(src, sp, base, voice_id, au, blur_args=blur, workdir=wd)

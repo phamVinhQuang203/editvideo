@@ -9,6 +9,7 @@ KHÔNG đăng bài. Dùng cho 2 nhánh:
 không import pipeline.py (tránh side-effect wrap stdout).
 """
 import sys, os, re, json, time, random, subprocess, glob, shutil, base64
+from urllib.parse import urlencode, urlparse
 
 # ---- ĐƯỜNG DẪN PORTABLE: mọi thứ tính TƯƠNG ĐỐI theo thư mục gói + config.json ----
 # app/ nằm trong <ROOT>; vendor/ chứa các script gốc (render_autovoice, detect_blur, ...).
@@ -112,10 +113,26 @@ VOICES_NU  = [("8VXsCLxU7Pn55ADXQc6sAf", "vbee_chinh"),
               ("wZtg5gNqQB8YTqHmE64KM2", "nu2")]
 GENMAX_VOICES = {
     "adam3": ("pNInz6obpgDQGcFmaJgB", "Adam - Dominant, Firm (GenMax)"),
+    "genmax_vu": ("kyWPawcLE727zSyf3yY6", "Vũ - Northern region (GenMax)"),
+    "genmax_ninhdon": ("aN7cv9yXNrfIR87bDmyD", "Ninh Đôn – Deep & Warm (GenMax)"),
     "genmax_duyen": ("DVQIYWzpAqd5qcoIlirg", "Duyen (GenMax)"),
     "genmax_anhthu": ("FRYq6nepIbR0lbu7Lus4", "Anh Thu (GenMax)"),
     "genmax_mai": ("d5HVupAWCwe4e6GvMCAL", "Mai (GenMax)"),
     "genmax_thanhngoc": ("Na15FlRRkMEDtEW4nVVP", "Thanh Ngoc (GenMax)"),
+    "genmax_minimax_serene_man": ("Vietnamese_Serene_Man", "Serene Man (MiniMax/GenMax)"),
+    "genmax_minimax_crisp_announcer_v2": ("Vietnamese_crisp_announcer_v2", "Crisp Announcer v2 (MiniMax/GenMax)"),
+    "genmax_capcut_cute_female": ("7102355709945188865", "Cute Female (CapCut/GenMax)"),
+    "genmax_capcut_sweet_girl": ("7252594014782755330", "Sweet Little Girl (CapCut/GenMax)"),
+    "genmax_capcut_female_standard": ("7264854897953083905", "Giọng nữ phổ thông (CapCut/GenMax)"),
+    "genmax_capcut_confident_male": ("7102355803792740865", "Confident Male (CapCut/GenMax)"),
+    "genmax_capcut_chi_mai": ("7483736254694035984", "Chí Mai (CapCut/GenMax)"),
+    "genmax_capcut_trung_caha": ("7491607775621943824", "Trung Caha (CapCut/GenMax)"),
+    "genmax_capcut_nam_tram": ("7493478233703191041", "Nam Trầm (CapCut/GenMax)"),
+    "genmax_capcut_ly_nam": ("7491608014181372417", "Ly Nam (CapCut/GenMax)"),
+    "genmax_capcut_duy_bac": ("7491608109043945985", "Duy Bắc (CapCut/GenMax)"),
+    "genmax_capcut_ha_nu": ("7491607926562361857", "Hà Nữ (CapCut/GenMax)"),
+    "genmax_capcut_sai_nu": ("7491607853086544400", "Sài Nữ (CapCut/GenMax)"),
+    "genmax_capcut_anh_dung": ("7483736167565758992", "Anh Dũng (CapCut/GenMax)"),
 }
 SPECIAL_VOICES = dict(GENMAX_VOICES)
 VOICE_BY_LABEL = {lb: vid for vid, lb in (VOICES_NAM + VOICES_NU)}
@@ -328,7 +345,7 @@ def log(m, job=None):
 
 # ---- CODEX (não vision) ----
 CODEX_MODEL = os.environ.get("CODEX_MODEL") or CONFIG.get("codex_model", "gpt-5.6-sol")
-def codex(prompt, image=None, effort="medium", timeout=300):
+def codex(prompt, image=None, effort="medium", timeout=300, strict=False):
     cmd = [CDX, "exec", "-c", f'model="{CODEX_MODEL}"', "-c", f'model_reasoning_effort="{effort}"',
            "--skip-git-repo-check"]
     if image: cmd.append(f"--image={image}")
@@ -336,11 +353,30 @@ def codex(prompt, image=None, effort="medium", timeout=300):
     p = subprocess.run(cmd, input=prompt, text=True, encoding="utf-8", errors="replace",
                        capture_output=True, timeout=timeout)
     out = (p.stdout or "").strip()
+    if strict and p.returncode:
+        detail = (p.stderr or "").strip()[-1500:]
+        # Avoid exposing configured credentials in job diagnostics.
+        for key, value in CONFIG.items():
+            if any(word in key.lower() for word in ("key", "token", "secret", "password")) and isinstance(value, str) and value:
+                detail = detail.replace(value, "[REDACTED]")
+        detail = re.sub(r"(?i)Bearer\s+\S+|\bsk-[\w-]+", "[REDACTED]", detail)
+        raise RuntimeError(f"Codex exit {p.returncode}: {detail or 'không có thông tin stderr'}")
+    if strict and not out:
+        raise RuntimeError("Codex không trả nội dung (stdout rỗng)")
     # codex exec in ra vài dòng header; lấy phần cuối
     return out
 
-def codex_json(prompt, image=None, effort="medium", timeout=300):
-    raw = codex(prompt, image=image, effort=effort, timeout=timeout)
+def codex_json(prompt, image=None, effort="medium", timeout=300, strict=False):
+    kwargs = {"strict": True} if strict else {}
+    raw = codex(prompt, image=image, effort=effort, timeout=timeout, **kwargs)
+    if strict:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
+        try:
+            return json.loads(cleaned)
+        except ValueError as exc:
+            raise RuntimeError(f"Codex trả JSON không hợp lệ ({len(raw)} ký tự): {exc.msg}") from exc
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         m = re.search(r"\[.*\]", raw, re.DOTALL)
@@ -452,13 +488,15 @@ def write_script(br, zh, contact, dur, hook_type="", style_key="", extra_note=""
     ht = hook_type or br.get("hook_type") or "pain_point"
     sblock = ("\n" + style_text(style_key)) if style_key else ""
     persona_seed = sum(ord(ch) for ch in f"{br.get('san_pham','')}|{ht}|{style_key}")
-    address_rule = (
-        'XƯNG HÔ BẮT BUỘC: xưng "tao", gọi người xem là "mày" hoặc "chúng mày"; '
-        'giữ nhất quán từ đầu đến cuối.'
-        if persona_seed % 2 == 0 else
-        'XƯNG HÔ BẮT BUỘC: xưng "anh", gọi người xem là "các vợ yêu" hoặc "các con vợ"; '
-        'giữ nhất quán từ đầu đến cuối.'
+    polite_addresses = (
+        'XƯNG HÔ BẮT BUỘC: người nói xưng "mình", gọi người xem là "bạn"; '
+        'giữ tự nhiên và nhất quán từ đầu đến cuối.',
+        'XƯNG HÔ BẮT BUỘC: người nói xưng "mình", gọi người xem là "các bạn"; '
+        'giữ thân thiện và nhất quán từ đầu đến cuối.',
+        'XƯNG HÔ BẮT BUỘC: người nói xưng "mình", gọi người xem là "mọi người"; '
+        'giữ gần gũi và nhất quán từ đầu đến cuối.',
     )
+    address_rule = polite_addresses[persona_seed % len(polite_addresses)]
     prompt = f"""Bạn là AutoVoice — viết LỜI THOẠI tiếng Việt cho video sản phẩm Facebook Reels.
 
 {_learned_directive(tgt)}{sblock}
@@ -467,10 +505,14 @@ BỘ NÃO đã thẩm định: Sản phẩm {br.get('san_pham','')} | Form {br.g
 {extra_note}
 {address_rule}
 TONE/NGÔN TỪ: hài hước, vui vẻ, lầy nhẹ, tự nhiên như đang tám chuyện. Không tục, không công kích.
+CẤM dùng cách xưng hô "tao – mày", "chúng mày", "các con vợ", "các vợ yêu".
 {GENMAX_EMOTION_GUIDE}
 LUẬT HOOK FB: câu đầu vào thẳng theo kiểu hook trên, cấm mở "Đây là...", kết đọng tự nhiên không hô hào.
 QUAN TRỌNG — KHỚP THỜI LƯỢNG: video dài {dur:.0f}s. Lời đọc kéo dài ~{tgt:.0f}s (~{words} từ, ±10) để phủ gần hết video. Contact-sheet 12 khung trải đều: viết lời theo ĐÚNG THỨ TỰ cảnh (1-4 mở, 5-8 giữa, 9-12 kết).
 VOICE GỐC tiếng Trung (lấy Ý, đừng dịch cứng): {zh or '(không có)'}
+NHỊP ĐỌC BẮT BUỘC: xen câu ngắn và câu vừa; dùng dấu phẩy để nghỉ nhẹ, dấu ba chấm cho
+điểm chờ, dấu hỏi/cảm thán ở hook hoặc điểm bất ngờ. Nhấn từ khóa bằng vị trí và dấu câu,
+không viết hoa cả câu, không kéo dài mọi câu và không để giọng đều đều như đọc văn bản.
 YÊU CẦU: CHỈ in lời thoại thuần."""
     return codex(prompt, image=contact), ht
 
@@ -636,6 +678,12 @@ def is_youtube_url(url):
     low = str(url or "").lower()
     return any(host in low for host in ("youtube.com/", "youtu.be/", "youtube-nocookie.com/"))
 
+
+def is_bilibili_mainland_url(url):
+    """Recognize public Bilibili China video links and b23.tv short links."""
+    host = (urlparse(str(url or "").strip()).hostname or "").lower()
+    return host == "b23.tv" or host == "bilibili.com" or host.endswith(".bilibili.com")
+
 def normalize_douyin_url(url):
     """Đổi link jingxuan/modal_id thành URL video mà downloader hiểu được."""
     value = str(url or "").strip()
@@ -766,6 +814,142 @@ def _youtube(url, workdir):
         log(f"download YouTube lỗi: {str(exc)[:180]}")
         return None, {}
 
+
+def _bilibili_mainland(url, workdir):
+    """Download one public bilibili.com video with yt-dlp."""
+    try:
+        import yt_dlp
+        outtmpl = os.path.join(workdir, "bilibili_mainland.%(ext)s")
+        opts = {
+            "outtmpl": outtmpl,
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "noprogress": True,
+            "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
+        }
+        with yt_dlp.YoutubeDL(opts) as downloader:
+            info = downloader.extract_info(url, download=True) or {}
+        candidates = sorted(glob.glob(os.path.join(workdir, "bilibili_mainland.*")),
+                            key=lambda path: os.path.getsize(path), reverse=True)
+        source = next((path for path in candidates
+                       if os.path.isfile(path) and os.path.getsize(path) > 50_000
+                       and not path.endswith((".part", ".ytdl", ".json"))), None)
+        if not source:
+            return None, {}
+        return source, {"title": info.get("title", ""), "dur": info.get("duration", ""),
+                        "uploader": info.get("uploader", "") or "Bilibili",
+                        "url": info.get("webpage_url", url)}
+    except Exception as exc:
+        log(f"download Bilibili lỗi: {str(exc)[:180]}")
+        return None, {}
+
+def _bilibili_tv_id(url):
+    """Return (id kind, id) for one concrete Bilibili TV episode/video."""
+    parsed = urlparse(url)
+    if parsed.hostname not in ("bilibili.tv", "www.bilibili.tv"):
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if parts and parts[0].lower() in ("vi", "en", "th", "id", "ms"):
+        parts = parts[1:]
+    if len(parts) >= 2 and parts[0] == "video" and parts[1].isdigit():
+        return "aid", parts[1]
+    if len(parts) >= 3 and parts[0] == "play" and parts[2].isdigit():
+        return "ep_id", parts[2]
+    return None
+
+def _bilibili_tv(url, workdir):
+    """Download a public Bilibili TV episode and merge its video/audio streams."""
+    video_id = _bilibili_tv_id(url)
+    if not video_id:
+        log("Link Bilibili TV phải là link của một tập/video cụ thể, không phải trang bộ phim.")
+        return None, {}
+    try:
+        kind, value = video_id
+        cookie = str(os.environ.get("BILIBILI_COOKIE") or CONFIG.get("bilibili_cookie") or "").strip()
+        if "\r" in cookie or "\n" in cookie:
+            raise ValueError("Bilibili Cookie không hợp lệ")
+        escaped_cookie = cookie.replace("\\", "\\\\").replace('"', '\\"')
+        cookie_config = f'header = "Cookie: {escaped_cookie}"\n' if cookie else None
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"),
+            "Referer": url,
+        }
+        # s_locale makes this endpoint intermittently reset connections; the player
+        # only needs platform, the concrete id, and an explicit quality.
+        params = {"platform": "web", kind: value, "qn": "64", "device": "wap"}
+        api_path = os.path.join(workdir, "bilibili_playurl.json")
+        api_errors = []
+        for api_host in ("api.bilibili.tv", "api.biliintl.com"):
+            if os.path.isfile(api_path):
+                os.remove(api_path)
+            api_url = f"https://{api_host}/intl/gateway/web/playurl?" + urlencode(params)
+            cookie_args = ["--config", "-"] if cookie_config else []
+            api = subprocess.run(
+                ["curl.exe", *cookie_args, "-fS", "-L", "--retry", "3", "--retry-all-errors",
+                 "--retry-delay", "1", "--connect-timeout", "15",
+                 "--max-time", "90", "-A", headers["User-Agent"],
+                 "-H", f"Referer: {url}", api_url, "-o", api_path],
+                input=cookie_config, capture_output=True, text=True,
+                encoding="utf-8", errors="replace")
+            if api.returncode == 0 and os.path.isfile(api_path) and os.path.getsize(api_path):
+                break
+            api_errors.append(f"{api_host}: {(api.stderr or 'không có phản hồi')[-120:]}")
+        else:
+            raise ValueError("API Bilibili TV không phản hồi: " + " | ".join(api_errors))
+        with open(api_path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+        if payload.get("code") != 0:
+            raise ValueError(payload.get("message") or f"API code {payload.get('code')}")
+        playurl = ((payload.get("data") or {}).get("playurl") or {})
+        videos = [item.get("video_resource") or {} for item in playurl.get("video") or []]
+        # AVC is compatible with all existing analysis/render stages.
+        videos = [item for item in videos if item.get("url") and item.get("codec_id") == 7]
+        audios = [item for item in playurl.get("audio_resource") or [] if item.get("url")]
+        if not videos or not audios:
+            raise ValueError("không có luồng video/audio công khai")
+        video = max(videos, key=lambda item: (int(item.get("quality") or 0),
+                                               int(item.get("bandwidth") or 0)))
+        audio = max(audios, key=lambda item: int(item.get("bandwidth") or 0))
+
+        def fetch(resource, destination):
+            last_error = ""
+            for media_url in [resource["url"], *(resource.get("backup_url") or [])]:
+                result = subprocess.run(
+                    ["curl.exe", "-fS", "-L", "--retry", "5", "--retry-all-errors",
+                     "--retry-delay", "1", "--connect-timeout", "15",
+                     "--max-time", "900", "-A", headers["User-Agent"],
+                     "-H", f"Referer: {url}", media_url,
+                     "-o", destination], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace")
+                last_error = result.stderr or ""
+                if (result.returncode == 0 and os.path.isfile(destination)
+                        and os.path.getsize(destination) > 50_000):
+                    return
+            raise ValueError(f"không tải được luồng media: {last_error[-160:]}")
+
+        video_path = os.path.join(workdir, "bilibili_video.m4s")
+        audio_path = os.path.join(workdir, "bilibili_audio.m4s")
+        destination = os.path.join(workdir, "bilibili.mp4")
+        fetch(video, video_path)
+        fetch(audio, audio_path)
+        merged = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", video_path, "-i", audio_path,
+             "-c", "copy", "-movflags", "+faststart", destination],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if merged.returncode or not os.path.isfile(destination) or os.path.getsize(destination) < 50_000:
+            raise ValueError(f"ffmpeg ghép luồng thất bại: {(merged.stderr or '')[-180:]}")
+        duration = float(playurl.get("duration") or 0) / 1000
+        return destination, {"title": f"Bilibili TV {value}", "dur": duration,
+                             "uploader": "Bilibili TV", "url": url}
+    except Exception as exc:
+        log(f"download Bilibili TV lỗi: {type(exc).__name__}: {str(exc)[:220]}")
+        return None, {}
+
 def download(url, workdir):
     """Ưu tiên tikwm (TikTok/Douyin, không watermark). FB -> fb_download. Douyin -> thêm fallback signed."""
     os.makedirs(workdir, exist_ok=True)
@@ -774,6 +958,12 @@ def download(url, workdir):
     # YouTube dùng nhánh riêng; không đi qua downloader Facebook/TikWM.
     if is_youtube_url(url):
         return _youtube(url, workdir)
+    # Bilibili TV's play API needs an explicit quality to avoid connection resets.
+    if urlparse(url).hostname in ("bilibili.tv", "www.bilibili.tv"):
+        return _bilibili_tv(url, workdir)
+    # Bilibili China and b23.tv use yt-dlp; keep this separate from Bilibili TV.
+    if is_bilibili_mainland_url(url):
+        return _bilibili_mainland(url, workdir)
     # 0) Google Drive công khai (link /file/d/... hoặc open?id=...)
     if "drive.google.com" in low:
         try:

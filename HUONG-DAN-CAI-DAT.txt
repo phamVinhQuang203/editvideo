@@ -23,8 +23,9 @@ Mac dinh:
 Neu can GPU/tach nhac/blur chu Trung:
   venv\Scripts\python.exe -m pip install -r requirements-optional.txt
 
-Chay ngam:
-- Chay ngam: wscript.exe .\start-studio-hidden.vbs
+Che do chay:
+- Khong ho tro chay ngam. Mo terminal va chay: .\start-studio.cmd
+- Giu terminal mo khi su dung; nhan Ctrl+C hoac dong terminal de dung server.
 - Log xu ly job: Get-Content .\logs\studio.log -Wait -Tail 100
 
 CLOUDFLARE - DUNG WEBSITE QUA INTERNET

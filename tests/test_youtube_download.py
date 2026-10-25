@@ -41,6 +41,15 @@ class YoutubeDownloadTests(unittest.TestCase):
             self.assertEqual("Demo", metadata["title"])
             self.assertEqual(12, metadata["dur"])
 
+    def test_bilibili_china_download_returns_file_and_metadata(self):
+        fake_module = types.SimpleNamespace(YoutubeDL=_FakeYoutubeDL)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"yt_dlp": fake_module}):
+            path, metadata = engine._bilibili_mainland(
+                "https://www.bilibili.com/video/BV1demo", directory)
+            self.assertTrue(os.path.exists(path))
+            self.assertEqual("Demo", metadata["title"])
+            self.assertEqual(12, metadata["dur"])
+
 
 if __name__ == "__main__":
     unittest.main()
